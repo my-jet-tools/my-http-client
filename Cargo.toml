@@ -1,0 +1,42 @@
+[package]
+name = "my-http-client"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# Web socket upgrade support. Without it a `101 Switching Protocols` is handed to
+# the caller as an ordinary response, and `hyper-tungstenite` is not compiled in
+with-websocket = ["hyper-tungstenite"]
+
+[dependencies]
+tokio = { version = "*" }
+bytes = "*"
+http-body-util = "*"
+async-trait = "*"
+
+lazy_static = "*"
+
+hyper-tungstenite = { version = "*", optional = true }
+http = "*"
+
+hyper-util = { version = "*", features = ["tokio", "server", "http2"] }
+
+futures = "*"
+
+hyper = { version = "*", features = ["full"] }
+
+rust-extensions = { tag = "0.1.5", git = "https://github.com/MyJetTools/rust-extensions.git", features = [
+    "with-tokio",
+] }
+
+parking_lot = "*"
+
+[dev-dependencies]
+tokio = { version = "*", features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "io-util",
+    "net",
+] }
