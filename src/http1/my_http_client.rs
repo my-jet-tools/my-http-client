@@ -414,6 +414,7 @@ impl<
             HttpTask::WebsocketUpgrade {
                 response,
                 read_part,
+                leftover,
             } => {
                 let write_part = self.inner.upgrade_to_websocket(connection_id).await?;
 
@@ -421,6 +422,7 @@ impl<
                 Ok(MyHttpResponse::WebSocketUpgrade {
                     stream,
                     response,
+                    leftover,
                     disconnection: Arc::new(MyHttpClientDisconnection::new(
                         self.inner.clone(),
                         connection_id,

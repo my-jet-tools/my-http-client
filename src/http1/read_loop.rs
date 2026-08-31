@@ -145,11 +145,21 @@ pub async fn read_loop<
                 #[cfg(feature = "with-websocket")]
                 BodyReader::WebSocketUpgrade(mut builder) => {
                     let upgrade_response = builder.take_upgrade_response();
+
+                    // The server normally writes its first websocket frame right
+                    // behind the 101, so both land in the same read() and the
+                    // frame is sitting in the buffer past the head. `tcp_buffer`
+                    // is local to this loop and dies with it, so what is left in
+                    // it has to travel with the socket - otherwise that first
+                    // frame is lost forever and only the second one is seen.
+                    let leftover = tcp_buffer.get_buf().to_vec();
+
                     let request = inner.pop_request(connection_id, true);
                     if let Some(mut request) = request {
                         let _ = request.try_set_ok(HttpTask::WebsocketUpgrade {
                             response: upgrade_response,
                             read_part: read_stream,
+                            leftover,
                         });
                     }
 

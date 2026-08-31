@@ -18,6 +18,11 @@ pub enum HttpTask<TStream: tokio::io::AsyncRead + Send + Sync + 'static> {
     WebsocketUpgrade {
         response: hyper::Response<BoxBody<Bytes, String>>,
         read_part: ReadHalf<TStream>,
+        /// Bytes which arrived in the same read() as the `101` head but past it -
+        /// typically the first websocket frame the server pushed straight after
+        /// the handshake. They are already consumed from the socket, so the
+        /// websocket side has to replay them before reading `read_part`.
+        leftover: Vec<u8>,
     },
 }
 
@@ -29,14 +34,21 @@ impl<TStream: tokio::io::AsyncRead + Send + Sync + 'static> HttpTask<TStream> {
         }
     }
 
+    /// The third element is the leftover of the upgrade read - it has to be
+    /// consumed before `read_part`, see [`HttpTask::WebsocketUpgrade`]
     pub fn unwrap_websocket_upgrade(
         self,
-    ) -> (hyper::Response<BoxBody<Bytes, String>>, ReadHalf<TStream>) {
+    ) -> (
+        hyper::Response<BoxBody<Bytes, String>>,
+        ReadHalf<TStream>,
+        Vec<u8>,
+    ) {
         match self {
             HttpTask::WebsocketUpgrade {
                 response,
                 read_part,
-            } => (response, read_part),
+                leftover,
+            } => (response, read_part, leftover),
             HttpTask::Response(_) => panic!("Can not unwrap as websocket upgrade"),
         }
     }

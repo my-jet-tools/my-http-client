@@ -593,3 +593,139 @@ async fn a_switching_protocols_response_is_delivered_to_the_caller() {
 
     assert_eq!(response.status(), 101);
 }
+
+/// An `AsyncRead` handing out exactly one scripted chunk per `read()` call. The
+/// read boundaries are the whole point of the websocket-leftover tests, and
+/// neither a duplex nor a real socket lets a test place them.
+#[cfg(feature = "with-websocket")]
+struct ScriptedReads {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+}
+
+#[cfg(feature = "with-websocket")]
+impl tokio::io::AsyncRead for ScriptedReads {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // Out of chunks: EOF
+        let Some(chunk) = self.chunks.pop_front() else {
+            return std::task::Poll::Ready(Ok(()));
+        };
+
+        assert!(
+            chunk.len() <= buf.remaining(),
+            "The scripted chunk does not fit into a single read"
+        );
+        buf.put_slice(&chunk);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// The upgrade request is written into a sink: nothing reads it back.
+#[cfg(feature = "with-websocket")]
+impl tokio::io::AsyncWrite for ScriptedReads {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Runs the real read loop over `chunks` with one GET awaiting its response, and
+/// returns the task the loop completed it with.
+#[cfg(feature = "with-websocket")]
+async fn read_loop_over(chunks: Vec<Vec<u8>>) -> super::HttpTask<ScriptedReads> {
+    const CONNECTION_ID: u64 = 1;
+
+    let stream = ScriptedReads {
+        chunks: chunks.into(),
+    };
+    let (read_half, write_half) = tokio::io::split(stream);
+
+    let inner = std::sync::Arc::new(super::MyHttpClientInner::new("test".to_string(), None));
+    inner
+        .new_connection(CONNECTION_ID, write_half, TIMEOUT)
+        .await;
+
+    let mut task = rust_extensions::TaskCompletion::new();
+    let awaiter = task.get_awaiter();
+    inner.queue_of_requests.push(Method::GET, task);
+
+    super::read_loop::read_loop(read_half, CONNECTION_ID, inner, TIMEOUT)
+        .await
+        .unwrap();
+
+    awaiter.get_result().await.unwrap()
+}
+
+#[cfg(feature = "with-websocket")]
+const WS_UPGRADE_HEAD: &[u8] =
+    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+/// An unmasked server text frame `hi`: FIN + opcode 1, length 2, payload.
+#[cfg(feature = "with-websocket")]
+const WS_FRAME: &[u8] = &[0x81, 0x02, b'h', b'i'];
+
+/// The server writes its first frame right behind the `101`, so both arrive in
+/// one read(). The head is parsed out of the buffer, the frame stays in it - and
+/// the buffer belongs to the read loop, which is about to return. Unless the
+/// remainder is handed over together with the socket, that first frame is lost
+/// forever and the caller only ever sees the second one.
+#[cfg(feature = "with-websocket")]
+#[tokio::test]
+async fn websocket_upgrade_carries_the_frame_which_arrived_with_the_101() {
+    let mut single_read = WS_UPGRADE_HEAD.to_vec();
+    single_read.extend_from_slice(WS_FRAME);
+
+    let task = read_loop_over(vec![single_read]).await;
+
+    match task {
+        super::HttpTask::WebsocketUpgrade {
+            response, leftover, ..
+        } => {
+            assert_eq!(response.status(), 101);
+            assert_eq!(leftover, WS_FRAME);
+        }
+        super::HttpTask::Response(_) => panic!("Expected WebsocketUpgrade, got Response"),
+    }
+}
+
+/// The other half of the same contract: when the `101` comes in a read of its
+/// own there is nothing past the head, so there is nothing to replay.
+#[cfg(feature = "with-websocket")]
+#[tokio::test]
+async fn websocket_upgrade_alone_in_its_read_has_no_leftover() {
+    let task = read_loop_over(vec![WS_UPGRADE_HEAD.to_vec()]).await;
+
+    match task {
+        super::HttpTask::WebsocketUpgrade {
+            response, leftover, ..
+        } => {
+            assert_eq!(response.status(), 101);
+            assert!(
+                leftover.is_empty(),
+                "Expected no leftover, got {:?}",
+                leftover
+            );
+        }
+        super::HttpTask::Response(_) => panic!("Expected WebsocketUpgrade, got Response"),
+    }
+}

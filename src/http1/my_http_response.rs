@@ -12,6 +12,11 @@ pub enum MyHttpResponse<
         stream: TStream,
         response: crate::HyperResponse,
         disconnection: Arc<dyn MyHttpClientDisconnect + Send + Sync + 'static>,
+        /// Bytes which came in the same read() as the `101` head but past it -
+        /// as a rule the first websocket frame, which servers write right behind
+        /// the handshake. They are already off the socket: feed them to the
+        /// websocket reader before `stream`, otherwise that frame is lost.
+        leftover: Vec<u8>,
     },
 }
 
