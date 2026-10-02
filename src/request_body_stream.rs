@@ -164,7 +164,7 @@ impl<TChunk: Into<Bytes> + Send + Sync + 'static> RequestBodyPublisher<TChunk> {
 ///     .method(my_http_client::http::Method::POST)
 ///     .uri("/upload")
 ///     .body(body)
-///     .unwrap();
+///     .map_err(|err| my_http_client::MyHttpClientError::CanNotExecuteRequest(err.to_string()))?;
 ///
 /// // None: the size of the payload is not known, so it goes out chunked
 /// client

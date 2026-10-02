@@ -14,7 +14,7 @@ pub async fn read_full_body<TStream: tokio::io::AsyncRead>(
     read_timeout: Duration,
 ) -> Result<http::Response<BoxBody<Bytes, String>>, HttpParseError> {
     if body_size == 0 {
-        return Ok(crate::utils::into_empty_body(builder));
+        return Ok(crate::utils::into_empty_body(builder)?);
     }
 
     if body_size > MAX_RESPONSE_BODY_SIZE {
@@ -37,12 +37,12 @@ pub async fn read_full_body<TStream: tokio::io::AsyncRead>(
         body[..remain_buffer.len()].copy_from_slice(remain_buffer);
 
         if remains_to_download == 0 {
-            return Ok(crate::utils::into_body(builder, body));
+            return Ok(crate::utils::into_body(builder, body)?);
         }
     }
 
     super::super::read_with_timeout::read_exact(read_stream, &mut body[read_pos..], read_timeout)
         .await?;
 
-    Ok(crate::utils::into_body(builder, body))
+    Ok(crate::utils::into_body(builder, body)?)
 }

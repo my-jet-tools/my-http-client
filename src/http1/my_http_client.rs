@@ -82,9 +82,8 @@ impl<
     pub async fn connect(&self) -> Result<(), MyHttpClientError> {
         let connect_feature = self.connector.connect();
 
-        let connect_result = tokio::time::timeout(self.connect_timeout, connect_feature).await;
-
-        if connect_result.is_err() {
+        let Ok(connect_result) = tokio::time::timeout(self.connect_timeout, connect_feature).await
+        else {
             return Err(MyHttpClientError::CanNotConnectToRemoteHost(format!(
                 "Can not connect to remote endpoint: '{}' Timeout: {:?}",
                 self.connector
@@ -93,7 +92,7 @@ impl<
                     .as_str(),
                 self.connect_timeout
             )));
-        }
+        };
 
         let receiver = {
             let mut state = self.inner.state.lock().await;
@@ -125,14 +124,14 @@ impl<
             });
         }
 
-        let stream = connect_result.unwrap()?;
+        let stream = connect_result?;
         let current_connection_id = CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let (reader, writer) = tokio::io::split(stream);
 
         self.inner
             .new_connection(current_connection_id, writer, self.send_to_socket_timeout)
-            .await;
+            .await?;
 
         let debug = self.connector.is_debug();
 
@@ -159,7 +158,10 @@ impl<
                         let task = inner_cloned.pop_request(current_connection_id, false);
 
                         if let Some(mut task) = task {
-                            task.set_error(MyHttpClientError::CanNotExecuteRequest(
+                            // The caller may be gone: a request which timed out stays
+                            // in the queue. Failing to tell them must not keep the
+                            // connection from being dropped below
+                            let _ = task.try_set_error(MyHttpClientError::CanNotExecuteRequest(
                                 invalid_payload_reason.to_string(),
                             ));
                         }
@@ -190,7 +192,8 @@ impl<
                 }
                 Err(err) => {
                     if let Some(mut task) = inner.pop_request(current_connection_id, false) {
-                        task.set_error(MyHttpClientError::CanNotExecuteRequest(
+                        // The caller may be gone - see the same call above
+                        let _ = task.try_set_error(MyHttpClientError::CanNotExecuteRequest(
                             "Request is panicked".to_string(),
                         ));
                     }
@@ -219,13 +222,10 @@ impl<
                 Ok((awaiter, connection_id)) => {
                     let await_feature = awaiter.get_result();
 
-                    let result = tokio::time::timeout(request_timeout, await_feature).await;
-
-                    if result.is_err() {
+                    let Ok(result) = tokio::time::timeout(request_timeout, await_feature).await
+                    else {
                         return Err(MyHttpClientError::RequestTimeout(request_timeout));
-                    }
-
-                    let result = result.unwrap();
+                    };
 
                     match result {
                         Ok(response) => return Ok((response, connection_id)),

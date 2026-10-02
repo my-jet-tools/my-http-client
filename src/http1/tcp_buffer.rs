@@ -89,7 +89,8 @@ impl TcpBuffer {
     pub fn read_until_crlf(&mut self) -> Option<&[u8]> {
         let mut pos = self.consumed_pos;
 
-        while pos < self.read_pos - 1 {
+        // Nothing is read into a new buffer yet, and a CRLF takes two bytes
+        while pos < self.read_pos.saturating_sub(1) {
             if &self.buffer[pos..pos + 2] == CRLF {
                 let result = &self.buffer[self.consumed_pos..pos];
                 self.consumed_pos = pos + 2;

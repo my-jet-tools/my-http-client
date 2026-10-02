@@ -83,14 +83,10 @@ impl MyHttpHyperClientInner {
             }
         };
 
-        let result = tokio::time::timeout(request_timeout, send_request_feature).await;
-
-        if result.is_err() {
+        let Ok(result) = tokio::time::timeout(request_timeout, send_request_feature).await else {
             self.disconnect(current_connection_id).await;
             return Err(SendHyperPayloadError::RequestTimeout(request_timeout));
-        }
-
-        let result = result.unwrap();
+        };
 
         match result {
             Ok(response) => Ok(crate::utils::from_incoming_body(response)),

@@ -20,13 +20,9 @@ pub async fn read_to_buffer<TStream: tokio::io::AsyncRead>(
         }
     };
 
-    let result = tokio::time::timeout(read_time_out, read.read(write_buf)).await;
-
-    if result.is_err() {
+    let Ok(result) = tokio::time::timeout(read_time_out, read.read(write_buf)).await else {
         return Err(HttpParseError::ReadingTimeout(read_time_out));
-    }
-
-    let result = result.unwrap();
+    };
 
     match result {
         Ok(result) => {
@@ -56,13 +52,11 @@ pub async fn read_exact<TStream: tokio::io::AsyncRead>(
     loop {
         let feature = read_stream.read(&mut buffer_to_write[pos..]);
 
-        let result = tokio::time::timeout(read_timeout, feature).await;
-
-        if result.is_err() {
+        let Ok(result) = tokio::time::timeout(read_timeout, feature).await else {
             return Err(HttpParseError::ReadingTimeout(read_timeout));
-        }
+        };
 
-        match result.unwrap() {
+        match result {
             Ok(result) => {
                 if result == 0 {
                     return Err(HttpParseError::Disconnected);

@@ -105,8 +105,9 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
                 if inner.streaming_request {
                     return None;
                 }
+                // Looked at first: what is queued must not be taken with nowhere to write it
+                let write_stream = inner.write_stream.as_mut()?;
                 let payload = inner.queue_to_deliver.take()?;
-                let write_stream = inner.write_stream.as_mut().unwrap();
                 Some((write_stream, payload, inner.send_to_socket_timeout))
             }
             WritePartState::UpgradedToWebSocket(_) => None,
@@ -179,16 +180,17 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
         state.1 = Some(sender);
     }
 
+    /// Fails when the client is disposed: a connection has nowhere to live then
     pub async fn new_connection(
         &self,
         connection_id: u64,
         write_stream: WriteHalf<TStream>,
         send_to_socket_timeout: std::time::Duration,
-    ) {
+    ) -> Result<(), MyHttpClientError> {
         let mut state = self.state.lock().await;
 
         if state.0.is_disposed() {
-            panic!("Disposed");
+            return Err(MyHttpClientError::Disposed);
         }
 
         self.process_disconnect(&mut state.0, WritePartState::Disconnected)
@@ -207,6 +209,8 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.tcp_connect(&self.name);
         }
+
+        Ok(())
     }
 
     pub fn is_my_connection_id(&self, connection_id: u64) -> bool {
@@ -219,8 +223,17 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
     ) -> Result<(HttpAwaiterTask<TStream>, u64), MyHttpClientError> {
         let mut writer = self.state.lock().await;
 
+        let write_loop = writer.1.clone();
+
         let (awaiter, connection_id) = {
             let connection_context = writer.0.unwrap_as_connected_mut()?;
+
+            // The write loop is what puts the request on the wire. With nobody to wake
+            // up, the request would sit in the queue until its caller gives up
+            if write_loop.is_none() {
+                return Err(MyHttpClientError::Disconnected);
+            }
+
             let mut task = TaskCompletion::new();
             let awaiter = task.get_awaiter();
 
@@ -240,12 +253,9 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
             (awaiter, self.connection_id.load(Ordering::Relaxed))
         };
 
-        let _ = writer
-            .1
-            .as_ref()
-            .unwrap()
-            .send(WriteLoopEvent::Flush(connection_id))
-            .await;
+        if let Some(write_loop) = write_loop {
+            let _ = write_loop.send(WriteLoopEvent::Flush(connection_id)).await;
+        }
 
         Ok((awaiter, connection_id))
     }
@@ -287,10 +297,13 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
             req.write_streamed_head_to(&mut payload, content_size);
 
             let send_to_socket_timeout = context.send_to_socket_timeout;
-            let write_stream = context.write_stream.as_mut().unwrap();
 
-            let write_result =
-                write_to_socket(write_stream, &payload, send_to_socket_timeout).await;
+            let write_result = match context.write_stream.as_mut() {
+                Some(write_stream) => {
+                    write_to_socket(write_stream, &payload, send_to_socket_timeout).await
+                }
+                None => Err(MyHttpClientError::Disconnected),
+            };
 
             if write_result.is_ok() {
                 context.streaming_request = true;
@@ -338,11 +351,15 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
             }
 
             let send_to_socket_timeout = context.send_to_socket_timeout;
-            let write_stream = context.write_stream.as_mut().unwrap();
 
-            match content_size {
-                Some(_) => write_to_socket(write_stream, chunk, send_to_socket_timeout).await,
-                None => write_chunk_to_socket(write_stream, chunk, send_to_socket_timeout).await,
+            match (context.write_stream.as_mut(), content_size) {
+                (Some(write_stream), Some(_)) => {
+                    write_to_socket(write_stream, chunk, send_to_socket_timeout).await
+                }
+                (Some(write_stream), None) => {
+                    write_chunk_to_socket(write_stream, chunk, send_to_socket_timeout).await
+                }
+                (None, _) => Err(MyHttpClientError::Disconnected),
             }
         };
 
@@ -379,11 +396,13 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
                 }
 
                 let send_to_socket_timeout = context.send_to_socket_timeout;
-                let write_stream = context.write_stream.as_mut().unwrap();
 
-                let result = match content_size {
-                    Some(_) => Ok(()),
-                    None => write_to_socket(write_stream, LAST_CHUNK, send_to_socket_timeout).await,
+                let result = match (content_size, context.write_stream.as_mut()) {
+                    (Some(_), _) => Ok(()),
+                    (None, Some(write_stream)) => {
+                        write_to_socket(write_stream, LAST_CHUNK, send_to_socket_timeout).await
+                    }
+                    (None, None) => Err(MyHttpClientError::Disconnected),
                 };
 
                 context.streaming_request = false;
@@ -428,7 +447,9 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
                     return Err(MyHttpClientError::Disconnected);
                 }
 
-                let result = context.write_stream.take();
+                let Some(write_stream) = context.write_stream.take() else {
+                    return Err(MyHttpClientError::Disconnected);
+                };
 
                 state.0 = WritePartState::UpgradedToWebSocket(WebSocketContextModel::new(
                     self.name.clone(),
@@ -437,7 +458,7 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
                 if let Some(metrics) = self.metrics.as_ref() {
                     metrics.upgraded_to_websocket(&self.name);
                 }
-                Ok(result.unwrap())
+                Ok(write_stream)
             }
             WritePartState::UpgradedToWebSocket(_) => Err(MyHttpClientError::UpgradedToWebSocket),
             WritePartState::Disconnected => Err(MyHttpClientError::Disconnected),
@@ -484,19 +505,11 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
             for chunk in payload.chunks(1024 * 1024) {
                 let future = stream.write_all(chunk);
 
-                let result = tokio::time::timeout(send_to_socket_timeout, future).await;
-
-                if result.is_err() {
+                // Neither a timeout nor a failed write leaves a connection to keep
+                let Ok(Ok(())) = tokio::time::timeout(send_to_socket_timeout, future).await else {
                     has_error = true;
                     break;
-                }
-
-                let result = result.unwrap();
-
-                if result.is_err() {
-                    has_error = true;
-                    break;
-                }
+                };
             }
         }
 
@@ -616,12 +629,16 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
     MyHttpClientDisconnect for MyHttpClientDisconnection<TStream>
 {
     fn disconnect(&self) {
-        let inner = self.inner.clone();
-        let connection_id = self.connection_id;
+        // It may be called outside a tokio runtime - out of a drop during shutdown, say -
+        // and tokio::spawn would panic there
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let inner = self.inner.clone();
+            let connection_id = self.connection_id;
 
-        tokio::spawn(async move {
-            inner.disconnect(connection_id).await;
-        });
+            handle.spawn(async move {
+                inner.disconnect(connection_id).await;
+            });
+        }
     }
 
     fn web_socket_disconnect(&self) {
@@ -629,12 +646,15 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
             metrics.websocket_is_disconnected(&self.inner.name);
         }
 
-        let inner = self.inner.clone();
-        let connection_id = self.connection_id;
+        // See `disconnect`
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let inner = self.inner.clone();
+            let connection_id = self.connection_id;
 
-        tokio::spawn(async move {
-            inner.disconnect(connection_id).await;
-        });
+            handle.spawn(async move {
+                inner.disconnect(connection_id).await;
+            });
+        }
     }
 
     fn get_connection_id(&self) -> u64 {

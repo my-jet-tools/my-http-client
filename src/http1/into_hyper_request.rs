@@ -1,160 +1,126 @@
-use std::str::FromStr;
-
 use bytes::Bytes;
-use http::{request::Builder, Uri, Version};
+use http::{request::Builder, Method, Uri, Version};
 use http_body_util::Full;
-use rust_extensions::{slice_of_u8_utils::SliceOfU8Ext, str_utils::StrUtils};
+
+use crate::RequestBuildError;
 
 use super::*;
 
 impl MyHttpRequest {
-    pub fn to_hyper_h1_request(&self) -> hyper::Request<Full<Bytes>> {
-        build_h1_headers(&self.headers)
+    /// Fails on a head which hyper does not take: no request line, a method, a path or
+    /// a header it refuses. The head is a public field and nothing here trusts it
+    pub fn to_hyper_h1_request(&self) -> Result<hyper::Request<Full<Bytes>>, RequestBuildError> {
+        build_h1_headers(&self.headers)?
             .body(Full::new(self.body.clone()))
-            .unwrap()
+            .map_err(not_convertible)
     }
 
-    pub fn to_hyper_h2_request(&self, is_https: bool) -> hyper::Request<Full<Bytes>> {
-        build_h2_headers(&self.headers, is_https)
+    /// The same as [`Self::to_hyper_h1_request`], with the `host` header turned into
+    /// the authority of the uri - which makes a host hyper does not take as an
+    /// authority one more reason to fail
+    pub fn to_hyper_h2_request(
+        &self,
+        is_https: bool,
+    ) -> Result<hyper::Request<Full<Bytes>>, RequestBuildError> {
+        build_h2_headers(&self.headers, is_https)?
             .body(Full::new(self.body.clone()))
-            .unwrap()
+            .map_err(not_convertible)
     }
 }
 
-fn build_h1_headers(headers: &[u8]) -> Builder {
-    let mut index = 0;
+fn not_convertible(reason: impl std::fmt::Display) -> RequestBuildError {
+    RequestBuildError::NotConvertibleToHyper(reason.to_string())
+}
 
-    let mut builder = Builder::new();
+fn build_h1_headers(headers: &[u8]) -> Result<Builder, RequestBuildError> {
+    let mut lines = lines(headers);
 
-    //Skipping first HTTP Line
-    let line_end_index = find_next_cl_cr(headers, index);
+    let (http_method, uri) = extract_http_method_and_uri(lines.next())?;
 
-    if line_end_index.is_none() {
-        panic!("Can not convert http headers to Hyper builder");
-    }
+    let mut builder = Builder::new().method(http_method).uri(uri);
 
-    let line_end_index = line_end_index.unwrap();
-    let line = &headers[index..line_end_index];
-
-    let (http_method, uri) = extract_http_method_and_uri(line);
-
-    builder = builder.method(http_method).uri(uri);
-    index += line_end_index + crate::CL_CR.len();
-
-    while let Some(line_end_index) = find_next_cl_cr(headers, index) {
-        let line = &headers[index..line_end_index];
+    for line in lines {
         let (name, value) = extract_name_and_value(line);
 
-        builder = builder.header(name.trim(), value.trim());
-
-        index = line_end_index + crate::CL_CR.len();
+        builder = builder.header(name.trim_ascii(), value.trim_ascii());
     }
 
-    builder
+    Ok(builder)
 }
 
-fn build_h2_headers(headers: &[u8], is_https: bool) -> Builder {
-    let mut index = 0;
+fn build_h2_headers(headers: &[u8], is_https: bool) -> Result<Builder, RequestBuildError> {
+    let mut lines = lines(headers);
+
+    let (http_method, uri) = extract_http_method_and_uri(lines.next())?;
 
     let mut builder = Builder::new().version(Version::HTTP_2);
 
-    //Skipping first HTTP Line
-    let line_end_index = find_next_cl_cr(headers, index);
-
-    if line_end_index.is_none() {
-        panic!("Can not convert http headers to Hyper builder");
-    }
-
-    let line_end_index = line_end_index.unwrap();
-    let line = &headers[index..line_end_index];
-
-    let (http_method, uri) = extract_http_method_and_uri(line);
-
-    index += line_end_index + crate::CL_CR.len();
-
     let mut host = None;
 
-    while let Some(line_end_index) = find_next_cl_cr(headers, index) {
-        let line = &headers[index..line_end_index];
+    for line in lines {
         let (name, value) = extract_name_and_value(line);
 
-        if name.eq_case_insensitive("host") {
-            host = Some(value.trim());
+        if name.eq_ignore_ascii_case(b"host") {
+            host = Some(value.trim_ascii());
         } else {
-            builder = builder.header(name.trim(), value.trim());
+            builder = builder.header(name.trim_ascii(), value.trim_ascii());
         }
-
-        index = line_end_index + crate::CL_CR.len();
     }
 
-    let uri = if let Some(host) = host {
-        if is_https {
-            Uri::builder()
-                .scheme("https")
-                .authority(host)
-                .path_and_query(uri)
-                .build()
-                .unwrap()
-        } else {
-            Uri::builder()
-                .scheme("http")
-                .authority(host)
-                .path_and_query(uri)
-                .build()
-                .unwrap()
-        }
-    } else {
-        Uri::builder().path_and_query(uri).build().unwrap()
+    let uri = match host {
+        Some(host) => Uri::builder()
+            .scheme(if is_https { "https" } else { "http" })
+            .authority(host)
+            .path_and_query(uri)
+            .build(),
+        None => Uri::builder().path_and_query(uri).build(),
+    }
+    .map_err(not_convertible)?;
+
+    Ok(builder.method(http_method).uri(uri))
+}
+
+/// The lines of a serialized head. Whatever follows the last CRLF is not a line
+fn lines(mut head: &[u8]) -> impl Iterator<Item = &[u8]> {
+    std::iter::from_fn(move || {
+        let line_end = head
+            .windows(crate::CL_CR.len())
+            .position(|window| window == crate::CL_CR)?;
+
+        let line = &head[..line_end];
+        head = &head[line_end + crate::CL_CR.len()..];
+        Some(line)
+    })
+}
+
+fn extract_http_method_and_uri(
+    request_line: Option<&[u8]>,
+) -> Result<(Method, &[u8]), RequestBuildError> {
+    let Some(request_line) = request_line else {
+        return Err(not_convertible("the head has no request line"));
     };
 
-    builder = builder.method(http_method).uri(uri);
-    builder
+    let mut parts = request_line.split(|b| *b == b' ');
+
+    let method = parts.next().unwrap_or_default();
+
+    let Some(path) = parts.next() else {
+        return Err(not_convertible("the request line has no path"));
+    };
+
+    let method = Method::from_bytes(method).map_err(not_convertible)?;
+
+    Ok((method, path))
 }
 
-fn extract_http_method_and_uri(line: &[u8]) -> (http::Method, &str) {
-    let str = unsafe { std::str::from_utf8_unchecked(line) };
-
-    let mut lines = str.split(' ');
-    let method = lines.next().unwrap();
-    let path = lines.next().unwrap();
-
-    (http::Method::from_str(method).unwrap(), path)
-}
-
-fn extract_name_and_value(line: &[u8]) -> (&str, &str) {
-    match line.find_byte_pos(b':', 0) {
-        Some(header_separator_index) => {
-            let name = &line[..header_separator_index];
-            let value = &line[header_separator_index + 1..];
-
-            unsafe {
-                let name = std::str::from_utf8_unchecked(name);
-                let value = std::str::from_utf8_unchecked(value);
-
-                (name, value)
-            }
-        }
-        None => {
-            unsafe {
-                let name = std::str::from_utf8_unchecked(line);
-                (name, "")
-            }
-        }
+fn extract_name_and_value(line: &[u8]) -> (&[u8], &[u8]) {
+    match line.iter().position(|b| *b == b':') {
+        Some(header_separator_index) => (
+            &line[..header_separator_index],
+            &line[header_separator_index + 1..],
+        ),
+        None => (line, &[]),
     }
-}
-
-fn find_next_cl_cr(slice: &[u8], from_index: usize) -> Option<usize> {
-    let mut i = from_index;
-
-    while i < slice.len() - 1 {
-        if &slice[i..i + 2] == crate::CL_CR {
-            return Some(i);
-        }
-
-        i += 1;
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -167,17 +133,20 @@ mod tests {
     #[test]
     fn test_converting() {
         let mut headers = MyHttpClientHeadersBuilder::new();
-        headers.add_header("content-type", "application/json");
-        headers.add_header("accept-language", "en-US");
+        headers
+            .add_header("content-type", "application/json")
+            .unwrap();
+        headers.add_header("accept-language", "en-US").unwrap();
         let request_builder = MyHttpRequest::new(
             Method::POST,
             "/test?aaa=12",
             Version::HTTP_11,
             &headers,
             vec![0u8, 1u8, 2u8],
-        );
+        )
+        .unwrap();
 
-        let body = request_builder.to_hyper_h1_request();
+        let body = request_builder.to_hyper_h1_request().unwrap();
 
         println!("{:?}", body);
     }
@@ -185,18 +154,21 @@ mod tests {
     #[test]
     fn test_converting_to_h2() {
         let mut headers = MyHttpClientHeadersBuilder::new();
-        headers.add_header("content-type", "application/json");
-        headers.add_header("accept-language", "en-US");
-        headers.add_header("host", "tokio.rs");
+        headers
+            .add_header("content-type", "application/json")
+            .unwrap();
+        headers.add_header("accept-language", "en-US").unwrap();
+        headers.add_header("host", "tokio.rs").unwrap();
         let request_builder = MyHttpRequest::new(
             Method::POST,
             "/test?aaa=12",
             Version::HTTP_11,
             &headers,
             vec![0u8, 1u8, 2u8],
-        );
+        )
+        .unwrap();
 
-        let body = request_builder.to_hyper_h2_request(true);
+        let body = request_builder.to_hyper_h2_request(true).unwrap();
 
         println!("{:?}", body);
     }

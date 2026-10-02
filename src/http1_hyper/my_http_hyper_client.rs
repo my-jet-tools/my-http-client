@@ -454,11 +454,15 @@ impl<
     > MyHttpClientDisconnect for MyHttpHyperClient<TStream, TConnector>
 {
     fn disconnect(&self) {
-        let inner = self.inner.clone();
-        let connection_id = self
-            .connection_id
-            .load(std::sync::atomic::Ordering::Relaxed);
-        tokio::spawn(async move { inner.disconnect(connection_id).await });
+        // It may be called outside a tokio runtime - out of a drop during shutdown, say -
+        // and tokio::spawn would panic there
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let inner = self.inner.clone();
+            let connection_id = self
+                .connection_id
+                .load(std::sync::atomic::Ordering::Relaxed);
+            handle.spawn(async move { inner.disconnect(connection_id).await });
+        }
     }
     fn web_socket_disconnect(&self) {
         // The connection that hosted the websocket is already released: hyper's

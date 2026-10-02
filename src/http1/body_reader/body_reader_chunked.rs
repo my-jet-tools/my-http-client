@@ -7,6 +7,9 @@ use tokio::io::ReadHalf;
 
 use crate::http1::{HttpParseError, TcpBuffer, MAX_CHUNK_SIZE};
 
+/// How much of a chunk size line is repeated in the text of an error
+const MAX_CHUNK_SIZE_LEN_IN_ERROR: usize = 16;
+
 #[derive(Debug, Clone, Copy)]
 pub enum ChunksReadingMode {
     WaitingFroChunkSize,
@@ -15,25 +18,58 @@ pub enum ChunksReadingMode {
     WaitingForEnd,
 }
 
-pub type ChunksSender =
-    futures::channel::mpsc::Sender<Result<hyper::body::Frame<Bytes>, hyper::Error>>;
+/// The chunks of a response body on their way to whoever reads it. The error is the
+/// reason the body is over before its terminating chunk: it is what tells a body which
+/// is cut short from a body which is complete
+pub type ChunksSender = futures::channel::mpsc::Sender<Result<hyper::body::Frame<Bytes>, String>>;
 
+/// Fails when the builder carries an error - a head of the response it did not take
 pub fn create_chunked_body_response(
     builder: http::response::Builder,
-) -> (ChunksSender, crate::HyperResponse) {
+) -> Result<(ChunksSender, crate::HyperResponse), http::Error> {
     let (sender, receiver) = futures::channel::mpsc::channel(1024);
     let stream_body = StreamBody::new(receiver);
 
-    let boxed_body = stream_body.map_err(|e: hyper::Error| e.to_string()).boxed();
-
-    let chunked_body_response = builder.body(boxed_body).unwrap();
-    (sender, chunked_body_response)
+    let chunked_body_response = builder.body(stream_body.boxed())?;
+    Ok((sender, chunked_body_response))
 }
 
+/// Reads the chunks off the socket and hands them over through `sender`.
+///
+/// The head of the response is already with the caller by the time the body is read, so
+/// a failure can not fail the request any more. It is sent down the body instead, as
+/// its last item - otherwise the body would just end, and what was read before the
+/// failure would look like the whole of it
 pub async fn read_chunked_body<TStream: tokio::io::AsyncRead>(
     read_stream: &mut ReadHalf<TStream>,
     tcp_buffer: &mut TcpBuffer,
-    mut sender: futures::channel::mpsc::Sender<Result<hyper::body::Frame<Bytes>, hyper::Error>>,
+    mut sender: ChunksSender,
+    read_timeout: Duration,
+    print_input_http_stream: bool,
+) -> Result<(), HttpParseError> {
+    use futures::SinkExt;
+
+    let result = read_chunks(
+        read_stream,
+        tcp_buffer,
+        &mut sender,
+        read_timeout,
+        print_input_http_stream,
+    )
+    .await;
+
+    if let Err(err) = &result {
+        // Nobody is reading the body when this fails, and then there is nobody to tell
+        let _ = sender.send(Err(why_the_body_is_not_complete(err))).await;
+    }
+
+    result
+}
+
+async fn read_chunks<TStream: tokio::io::AsyncRead>(
+    read_stream: &mut ReadHalf<TStream>,
+    tcp_buffer: &mut TcpBuffer,
+    sender: &mut ChunksSender,
     read_timeout: Duration,
     print_input_http_stream: bool,
 ) -> Result<(), HttpParseError> {
@@ -114,6 +150,20 @@ pub async fn read_chunked_body<TStream: tokio::io::AsyncRead>(
     }
 }
 
+fn why_the_body_is_not_complete(err: &HttpParseError) -> String {
+    let reason = match err {
+        HttpParseError::InvalidHttpPayload(reason) => reason.as_str().to_string(),
+        HttpParseError::Error(reason) => reason.as_str().to_string(),
+        HttpParseError::Disconnected => "the connection is closed".to_string(),
+        HttpParseError::ReadingTimeout(timeout) => {
+            format!("no data from the upstream for {:?}", timeout)
+        }
+        HttpParseError::GetMoreData => "the rest of it has not arrived".to_string(),
+    };
+
+    format!("The chunked body is not complete: {}", reason)
+}
+
 fn parse_chunk_size(src: &[u8]) -> Result<usize, HttpParseError> {
     let mut end_of_hex = src.len();
 
@@ -125,9 +175,13 @@ fn parse_chunk_size(src: &[u8]) -> Result<usize, HttpParseError> {
     }
 
     if end_of_hex == 0 {
+        // The line is whatever the upstream has sent: it does not have to be UTF-8 and
+        // it can be as long as the read buffer
+        let shown = &src[..src.len().min(MAX_CHUNK_SIZE_LEN_IN_ERROR)];
+
         return Err(HttpParseError::invalid_payload(format!(
             "Invalid chunk size: {:?}",
-            std::str::from_utf8(src).unwrap()
+            String::from_utf8_lossy(shown)
         )));
     }
 

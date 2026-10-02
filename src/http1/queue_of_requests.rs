@@ -13,6 +13,14 @@ pub type HttpAwaitingTask<TStream> = TaskCompletion<HttpTask<TStream>, MyHttpCli
 
 pub type HttpAwaiterTask<TStream> = TaskCompletionAwaiter<HttpTask<TStream>, MyHttpClientError>;
 
+/// What a websocket upgrade is made of: the response, the read half of the socket and
+/// the leftover of the upgrade read
+pub type WebsocketUpgradeParts<TStream> = (
+    hyper::Response<BoxBody<Bytes, String>>,
+    ReadHalf<TStream>,
+    Vec<u8>,
+);
+
 pub enum HttpTask<TStream: tokio::io::AsyncRead + Send + Sync + 'static> {
     Response(hyper::Response<BoxBody<Bytes, String>>),
     WebsocketUpgrade {
@@ -34,22 +42,18 @@ impl<TStream: tokio::io::AsyncRead + Send + Sync + 'static> HttpTask<TStream> {
         }
     }
 
+    /// `None` is a task which is not a websocket upgrade.
+    ///
     /// The third element is the leftover of the upgrade read - it has to be
     /// consumed before `read_part`, see [`HttpTask::WebsocketUpgrade`]
-    pub fn unwrap_websocket_upgrade(
-        self,
-    ) -> (
-        hyper::Response<BoxBody<Bytes, String>>,
-        ReadHalf<TStream>,
-        Vec<u8>,
-    ) {
+    pub fn into_websocket_upgrade(self) -> Option<WebsocketUpgradeParts<TStream>> {
         match self {
             HttpTask::WebsocketUpgrade {
                 response,
                 read_part,
                 leftover,
-            } => (response, read_part, leftover),
-            HttpTask::Response(_) => panic!("Can not unwrap as websocket upgrade"),
+            } => Some((response, read_part, leftover)),
+            HttpTask::Response(_) => None,
         }
     }
 }
@@ -79,7 +83,14 @@ impl<TStream: tokio::io::AsyncRead + Send + Sync + 'static> QueueOfRequests<TStr
         }
     }
 
-    pub fn push(&self, method: Method, task: HttpAwaitingTask<TStream>) {
+    pub fn push(&self, method: Method, mut task: HttpAwaitingTask<TStream>) {
+        // A task which is dropped with no result set makes its awaiter panic, unless it
+        // is told what to report instead. Nothing here drops one, and if something ever
+        // does, the caller gets an error
+        task.set_drop_error(MyHttpClientError::CanNotExecuteRequest(
+            "The request is dropped with no result".to_string(),
+        ));
+
         self.queue.lock().push_back(QueuedRequest { method, task });
     }
 

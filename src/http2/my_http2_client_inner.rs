@@ -106,18 +106,14 @@ impl MyHttp2ClientInner {
             }
         };
 
-        let result = tokio::time::timeout(request_timeout, send_request_feature).await;
-
-        if result.is_err() {
+        let Ok(result) = tokio::time::timeout(request_timeout, send_request_feature).await else {
             // Dropping the timed out send_request future cancels only its own h2 stream
             // (RST_STREAM), so the connection stays available to other multiplexed
             // streams instead of being torn down because of one slow response.
             self.register_request_timeout(current_connection_id, request_timeout)
                 .await;
             return Err(SendHyperPayloadError::RequestTimeout(request_timeout));
-        }
-
-        let result = result.unwrap();
+        };
 
         match result {
             Ok(response) => {

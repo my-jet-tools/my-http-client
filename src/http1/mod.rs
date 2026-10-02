@@ -45,6 +45,15 @@ mod response_framing_tests;
 #[cfg(test)]
 mod streaming_body_tests;
 
+#[cfg(test)]
+mod request_input_tests;
+
+#[cfg(test)]
+mod response_input_tests;
+
+#[cfg(test)]
+mod contract_tests;
+
 const CONTENT_LENGTH_HEADER_NAME: &str = "content-length";
 const TRANSFER_ENCODING_HEADER_NAME: &str = "transfer-encoding";
 
@@ -113,5 +122,13 @@ impl HttpParseError {
             HttpParseError::InvalidHttpPayload(src) => Some(src.as_str()),
             _ => None,
         }
+    }
+}
+
+/// A response builder which did not take the head it was fed with: what the upstream
+/// has sent is not a response this client can hand over
+impl From<http::Error> for HttpParseError {
+    fn from(err: http::Error) -> Self {
+        HttpParseError::invalid_payload(format!("Invalid HTTP response head: {}", err))
     }
 }

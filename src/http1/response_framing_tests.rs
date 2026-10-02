@@ -516,10 +516,19 @@ fn get_method_parses_serialized_request_line() {
         Method::POST,
         Method::DELETE,
     ] {
-        let req = MyHttpRequest::new(method.clone(), "/path?x=1", Version::HTTP_11, &headers, vec![]);
+        let req = MyHttpRequest::new(
+            method.clone(),
+            "/path?x=1",
+            Version::HTTP_11,
+            &headers,
+            vec![],
+        )
+        .unwrap();
         assert_eq!(req.get_method(), method, "MyHttpRequest::new path");
 
-        let built = MyHttpRequestBuilder::new(method.clone(), "/path?x=1").build();
+        let built = MyHttpRequestBuilder::new(method.clone(), "/path?x=1")
+            .unwrap()
+            .build();
         assert_eq!(built.get_method(), method, "MyHttpRequestBuilder path");
     }
 }
@@ -582,9 +591,9 @@ async fn a_switching_protocols_response_is_delivered_to_the_caller() {
     });
 
     let mut headers = MyHttpClientHeadersBuilder::new();
-    headers.add_header("host", "localhost");
+    headers.add_header("host", "localhost").unwrap();
 
-    let request = MyHttpRequest::new(Method::GET, "/", Version::HTTP_11, &headers, vec![]);
+    let request = MyHttpRequest::new(Method::GET, "/", Version::HTTP_11, &headers, vec![]).unwrap();
 
     let response = client
         .do_request(&request, Duration::from_secs(1))
@@ -663,7 +672,8 @@ async fn read_loop_over(chunks: Vec<Vec<u8>>) -> super::HttpTask<ScriptedReads> 
     let inner = std::sync::Arc::new(super::MyHttpClientInner::new("test".to_string(), None));
     inner
         .new_connection(CONNECTION_ID, write_half, TIMEOUT)
-        .await;
+        .await
+        .unwrap();
 
     let mut task = rust_extensions::TaskCompletion::new();
     let awaiter = task.get_awaiter();

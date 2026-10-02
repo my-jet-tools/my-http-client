@@ -62,12 +62,17 @@ impl WebSocketUpgradeBuilder {
         }
     }
 
-    pub fn take_upgrade_response(&mut self) -> http::Response<BoxBody<Bytes, String>> {
-        let builder = self.builder.take();
-        if builder.is_none() {
-            panic!("WebSocket upgrade response is already taken");
-        }
+    /// Fails when the response is taken already, and when the builder carries an error -
+    /// a head of the upgrade response it did not take
+    pub fn take_upgrade_response(
+        &mut self,
+    ) -> Result<http::Response<BoxBody<Bytes, String>>, super::HttpParseError> {
+        let Some(builder) = self.builder.take() else {
+            return Err(super::HttpParseError::error(
+                "WebSocket upgrade response is already taken",
+            ));
+        };
 
-        crate::utils::into_empty_body(builder.unwrap())
+        Ok(crate::utils::into_empty_body(builder)?)
     }
 }

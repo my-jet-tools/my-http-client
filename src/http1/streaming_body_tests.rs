@@ -45,7 +45,7 @@ const OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
 
 fn create_headers() -> MyHttpClientHeadersBuilder {
     let mut headers = MyHttpClientHeadersBuilder::new();
-    headers.add_header("host", "localhost");
+    headers.add_header("host", "localhost").unwrap();
     headers
 }
 
@@ -69,7 +69,8 @@ async fn test_streamed_body_is_sent_chunked() {
     client.connect().await.unwrap();
 
     let request =
-        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers());
+        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers())
+            .unwrap();
 
     let (publisher, body) = RequestBodyStream::new(1);
 
@@ -113,7 +114,8 @@ async fn test_streamed_body_of_a_known_size_is_sent_with_content_length() {
     client.connect().await.unwrap();
 
     let request =
-        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers());
+        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers())
+            .unwrap();
 
     let (publisher, body) = RequestBodyStream::new(1);
 
@@ -158,7 +160,8 @@ async fn test_a_body_shorter_than_the_announced_content_length_is_refused() {
     client.connect().await.unwrap();
 
     let request =
-        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers());
+        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers())
+            .unwrap();
 
     let body = StreamBody::new(futures::stream::iter(vec![Ok::<_, String>(Frame::data(
         Bytes::from_static(b"12345"),
@@ -198,7 +201,8 @@ async fn test_a_body_bigger_than_the_announced_content_length_is_refused() {
     client.connect().await.unwrap();
 
     let request =
-        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers());
+        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers())
+            .unwrap();
 
     // The bytes past the announced size would be read as the next request
     let body = StreamBody::new(futures::stream::iter(vec![Ok::<_, String>(Frame::data(
@@ -249,7 +253,8 @@ async fn test_a_request_issued_while_streaming_goes_out_after_the_body() {
     client.connect().await.unwrap();
 
     let streamed_head =
-        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers());
+        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers())
+            .unwrap();
 
     let (publisher, body) = RequestBodyStream::new(1);
 
@@ -272,7 +277,8 @@ async fn test_a_request_issued_while_streaming_goes_out_after_the_body() {
             Version::HTTP_11,
             &create_headers(),
             b"pipelined-payload".to_vec(),
-        );
+        )
+        .unwrap();
 
         pipelined_client
             .do_request(&request, Duration::from_secs(5))
@@ -325,7 +331,8 @@ async fn test_streamed_request_is_not_retried_after_the_head_reached_the_wire() 
     client.connect().await.unwrap();
 
     let request =
-        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers());
+        MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &create_headers())
+            .unwrap();
 
     let body = StreamBody::new(futures::stream::iter(vec![Ok::<_, String>(Frame::data(
         Bytes::from_static(b"1234567890"),
@@ -354,7 +361,8 @@ async fn test_a_head_with_content_length_is_refused() {
         Version::HTTP_11,
         &create_headers(),
         b"1234567890".to_vec(),
-    );
+    )
+    .unwrap();
 
     let body = StreamBody::new(futures::stream::iter(
         Vec::<Result<Frame<Bytes>, String>>::new(),

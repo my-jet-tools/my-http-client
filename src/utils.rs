@@ -12,12 +12,14 @@ pub fn into_full_body_response(
     hyper::Response::from_parts(parts, body)
 }
 
+/// Fails when the builder carries an error - a header name or a value it was given
+/// and did not take
 pub fn into_empty_body(
     builder: http::response::Builder,
-) -> hyper::Response<BoxBody<Bytes, String>> {
+) -> Result<hyper::Response<BoxBody<Bytes, String>>, http::Error> {
     let body = Full::new(Bytes::new());
     let body = body.map_err(|e| e.to_string()).boxed();
-    builder.body(body).unwrap()
+    builder.body(body)
 }
 
 /// Erases a buffered request body into the trait object the connections speak in
@@ -40,12 +42,11 @@ pub fn from_incoming_body(response: Response<Incoming>) -> Response<BoxBody<Byte
     Response::from_parts(parts, box_body)
 }
 
+/// Fails when the builder carries an error - see [`into_empty_body`]
 pub fn into_body(
     builder: http::response::Builder,
     body: Vec<u8>,
-) -> http::Response<BoxBody<Bytes, String>> {
+) -> Result<http::Response<BoxBody<Bytes, String>>, http::Error> {
     let full_body = http_body_util::Full::new(hyper::body::Bytes::from(body));
-    builder
-        .body(full_body.map_err(|itm| itm.to_string()).boxed())
-        .unwrap()
+    builder.body(full_body.map_err(|itm| itm.to_string()).boxed())
 }

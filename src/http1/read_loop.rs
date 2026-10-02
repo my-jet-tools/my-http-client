@@ -134,7 +134,7 @@ pub async fn read_loop<
                     // final answer, and the connection can not serve HTTP any
                     // more. Returning Ok(()) lets `read_loop_stopped` move it to
                     // Disconnected so the next send dials a new one.
-                    let response = crate::utils::into_empty_body(builder);
+                    let response = crate::utils::into_empty_body(builder)?;
                     let request = inner.pop_request(connection_id, false);
                     if let Some(mut request) = request {
                         let _ = request.try_set_ok(HttpTask::Response(response));
@@ -144,7 +144,7 @@ pub async fn read_loop<
                 }
                 #[cfg(feature = "with-websocket")]
                 BodyReader::WebSocketUpgrade(mut builder) => {
-                    let upgrade_response = builder.take_upgrade_response();
+                    let upgrade_response = builder.take_upgrade_response()?;
 
                     // The server normally writes its first websocket frame right
                     // behind the 101, so both land in the same read() and the

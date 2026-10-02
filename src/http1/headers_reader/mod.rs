@@ -94,7 +94,7 @@ pub async fn read_headers<TStream: tokio::io::AsyncRead>(
             body_size: 0,
         }),
         DetectedBodySize::Chunked => {
-            let (sender, response) = create_chunked_body_response(builder);
+            let (sender, response) = create_chunked_body_response(builder)?;
             Ok(BodyReader::Chunked { response, sender })
         }
         DetectedBodySize::Known(body_size) => Ok(BodyReader::LengthBased { builder, body_size }),

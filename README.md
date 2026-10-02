@@ -1,6 +1,6 @@
 # my-http-client
 
-Low level HTTP client building blocks used by the MyJetTools stack (fl-url, my-reverse-proxy).
+Low level HTTP client building blocks of the MyJetTools stack.
 The crate owns the connection - it dials through a pluggable `MyHttpClientConnector`, keeps the
 connection alive between the requests, and reconnects when the peer drops it.
 
@@ -191,7 +191,8 @@ carries no reason back to the producing side.
 request is never retried once its head has reached the wire:
 
 ```rust
-let head = MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &headers);
+// Err: the path has a CR, LF, NUL or a space in it and can not be put into a request line
+let head = MyHttpRequest::new_streamed(Method::POST, "/upload", Version::HTTP_11, &headers)?;
 
 let (publisher, body) = RequestBodyStream::new(4);
 
@@ -285,5 +286,5 @@ caller as the final, bodyless response, and the connection is retired instead of
 ## Retry layering
 
 The client retries only what it can prove is safe on its own connection. Replaying a request which
-may have already been executed upstream belongs to the caller, which owns the source data - fl-url
-does exactly that in its own `execute_with_retry` loop, for idempotent methods only.
+may have already been executed upstream belongs to the caller: it owns the source data and knows
+which requests are safe to send twice - as a rule the idempotent methods only.

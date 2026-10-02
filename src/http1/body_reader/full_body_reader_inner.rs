@@ -8,7 +8,8 @@ pub struct FullBodyReaderInner {
 }
 
 impl FullBodyReaderInner {
-    pub fn into_body(self) -> hyper::Response<BoxBody<Bytes, String>> {
+    /// Fails when the builder carries an error - a header it was given and did not take
+    pub fn into_body(self) -> Result<hyper::Response<BoxBody<Bytes, String>>, http::Error> {
         /*
         let builder = if set_body_size {
             self.builder
@@ -25,6 +26,5 @@ impl FullBodyReaderInner {
         let full_body = http_body_util::Full::new(hyper::body::Bytes::from(self.body));
         self.builder
             .body(full_body.map_err(|itm| itm.to_string()).boxed())
-            .unwrap()
     }
 }

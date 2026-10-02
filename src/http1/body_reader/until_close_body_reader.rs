@@ -46,16 +46,14 @@ pub async fn read_until_close<TStream: tokio::io::AsyncRead>(
     loop {
         let future = read_stream.read(&mut read_buf);
 
-        let result = tokio::time::timeout(read_timeout, future).await;
-
-        if result.is_err() {
+        let Ok(result) = tokio::time::timeout(read_timeout, future).await else {
             return Err(HttpParseError::ReadingTimeout(read_timeout));
-        }
+        };
 
-        match result.unwrap() {
+        match result {
             Ok(0) => {
                 // Connection closed cleanly: the body is complete.
-                return Ok(crate::utils::into_body(builder, body));
+                return Ok(crate::utils::into_body(builder, body)?);
             }
             Ok(read) => {
                 body.extend_from_slice(&read_buf[..read]);
