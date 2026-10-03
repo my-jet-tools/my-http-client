@@ -46,6 +46,9 @@ mod response_framing_tests;
 mod streaming_body_tests;
 
 #[cfg(test)]
+mod streamed_response_body_tests;
+
+#[cfg(test)]
 mod request_input_tests;
 
 #[cfg(test)]
@@ -57,6 +60,9 @@ mod contract_tests;
 const CONTENT_LENGTH_HEADER_NAME: &str = "content-length";
 const TRANSFER_ENCODING_HEADER_NAME: &str = "transfer-encoding";
 
+/// The largest body [`read_full_body`] and [`read_until_close`] read into memory. The
+/// client itself reads a body that way only up to [`STREAMED_BODY_THRESHOLD`] - a bigger
+/// one, or a close-delimited one, streams and is limited by whoever reads it.
 pub const MAX_RESPONSE_BODY_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 pub const MAX_RESPONSE_HEADERS_COUNT: usize = 256;
