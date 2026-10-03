@@ -9,8 +9,6 @@ mod body_reader_chunked;
 pub use body_reader_chunked::*;
 mod until_close_body_reader;
 pub use until_close_body_reader::*;
-mod streamed_body_reader;
-pub use streamed_body_reader::*;
 
 mod full_body_reader_inner;
 pub use full_body_reader_inner::*;

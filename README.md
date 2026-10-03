@@ -14,8 +14,7 @@ and over the connector which produces it:
 | `http2`        | HTTP/2 on top of `hyper::client::conn::http2`                                 |
 
 This document covers the request bodies - the buffered and the streamed one. All three clients can
-stream a request body through `do_streamed_request`. How `http1` hands a response body over is in
-[Response bodies of the non-hyper client](#response-bodies-of-the-non-hyper-client-http1).
+stream a request body through `do_streamed_request`.
 
 ## Features
 
@@ -228,28 +227,6 @@ own. If the upload breaks half way through (a timeout, a producer error, a dead 
 connection is dropped: an upstream waiting for the rest of the chunks can not be reused.
 
 Trailers are not sent - a frame which is not data is skipped.
-
-## Response bodies of the non-hyper client (`http1`)
-
-`do_request` returns on the head of the response; whether the body is in memory by then depends on
-its framing:
-
-| body | handed over |
-| --- | --- |
-| `content-length` up to `STREAMED_BODY_THRESHOLD` (64 KB) | read whole first, a `Full` body |
-| `content-length` above it | streams behind the head, in frames of at most 64 KB |
-| `transfer-encoding: chunked` | streams behind the head, a frame per chunk |
-| close-delimited (neither of the two) | streams until the connection is closed |
-
-A streamed body is not held by the client: at most `STREAMED_BODY_CHANNEL_CAPACITY` frames wait for
-the reader, then the client stops reading the socket. **How big a body may grow is the reader's
-decision** - collect it with a limit of your own, or drop it. Dropping a body half read leaves the
-rest of it on the wire, so that connection is over and the next request dials a new one.
-
-A streamed body which can not be completed - the connection closed, a read timeout - ends with an
-error as its last frame (`The response body is not complete: ...`), so a body cut short never passes
-for a whole one. The request itself has succeeded by then: `request_timeout` covers the way to the
-head, the body is bounded by the read timeout of every single read.
 
 ## Streaming over HTTP/2 (`http2`)
 

@@ -27,20 +27,11 @@ pub type ChunksSender = futures::channel::mpsc::Sender<Result<hyper::body::Frame
 pub fn create_chunked_body_response(
     builder: http::response::Builder,
 ) -> Result<(ChunksSender, crate::HyperResponse), http::Error> {
-    create_body_response(builder, 1024)
-}
-
-/// The response with a body which comes through the returned sender, `capacity` frames
-/// of it at most waiting for the reader
-pub(crate) fn create_body_response(
-    builder: http::response::Builder,
-    capacity: usize,
-) -> Result<(ChunksSender, crate::HyperResponse), http::Error> {
-    let (sender, receiver) = futures::channel::mpsc::channel(capacity);
+    let (sender, receiver) = futures::channel::mpsc::channel(1024);
     let stream_body = StreamBody::new(receiver);
 
-    let response = builder.body(stream_body.boxed())?;
-    Ok((sender, response))
+    let chunked_body_response = builder.body(stream_body.boxed())?;
+    Ok((sender, chunked_body_response))
 }
 
 /// Reads the chunks off the socket and hands them over through `sender`.
@@ -69,9 +60,7 @@ pub async fn read_chunked_body<TStream: tokio::io::AsyncRead>(
 
     if let Err(err) = &result {
         // Nobody is reading the body when this fails, and then there is nobody to tell
-        let _ = sender
-            .send(Err(why_the_body_is_not_complete("chunked", err)))
-            .await;
+        let _ = sender.send(Err(why_the_body_is_not_complete(err))).await;
     }
 
     result
@@ -161,8 +150,7 @@ async fn read_chunks<TStream: tokio::io::AsyncRead>(
     }
 }
 
-/// The last item of a streamed body cut short. `body` names which body it is
-pub(crate) fn why_the_body_is_not_complete(body: &str, err: &HttpParseError) -> String {
+fn why_the_body_is_not_complete(err: &HttpParseError) -> String {
     let reason = match err {
         HttpParseError::InvalidHttpPayload(reason) => reason.as_str().to_string(),
         HttpParseError::Error(reason) => reason.as_str().to_string(),
@@ -173,7 +161,7 @@ pub(crate) fn why_the_body_is_not_complete(body: &str, err: &HttpParseError) -> 
         HttpParseError::GetMoreData => "the rest of it has not arrived".to_string(),
     };
 
-    format!("The {} body is not complete: {}", body, reason)
+    format!("The chunked body is not complete: {}", reason)
 }
 
 fn parse_chunk_size(src: &[u8]) -> Result<usize, HttpParseError> {

@@ -68,34 +68,6 @@ pub async fn read_loop<
                     }
                     continue;
                 }
-                BodyReader::LengthBased { builder, body_size }
-                    if body_size > super::STREAMED_BODY_THRESHOLD =>
-                {
-                    // Too big to be held before the caller sees it: the head goes
-                    // out now and the body streams behind it, the way a chunked one
-                    // does. How much of it to take is the caller's decision.
-                    interim_count = 0;
-                    let (sender, response) =
-                        super::body_reader::create_streamed_body_response(builder)?;
-
-                    let request = inner.pop_request(connection_id, false);
-                    if let Some(mut request) = request {
-                        let result = request.try_set_ok(HttpTask::Response(response));
-
-                        if result.is_err() {
-                            return Ok(());
-                        }
-                    }
-
-                    super::body_reader::read_length_based_body(
-                        &mut read_stream,
-                        &mut tcp_buffer,
-                        sender,
-                        body_size,
-                        read_timeout,
-                    )
-                    .await?;
-                }
                 BodyReader::LengthBased { builder, body_size } => {
                     interim_count = 0;
                     let response = super::body_reader::read_full_body(
@@ -122,24 +94,18 @@ pub async fn read_loop<
                     // connection must not be reused for keep-alive. Returning
                     // Ok(()) lets `read_loop_stopped` transition it to
                     // Disconnected so the next send reconnects.
-                    // Nothing says how big it is, so it streams like a big one.
-                    let (sender, response) =
-                        super::body_reader::create_streamed_body_response(builder)?;
-
-                    let request = inner.pop_request(connection_id, false);
-                    if let Some(mut request) = request {
-                        if request.try_set_ok(HttpTask::Response(response)).is_err() {
-                            return Ok(());
-                        }
-                    }
-
-                    super::body_reader::read_body_until_close(
+                    let response = super::body_reader::read_until_close(
                         &mut read_stream,
                         &mut tcp_buffer,
-                        sender,
+                        builder,
                         read_timeout,
                     )
                     .await?;
+
+                    let request = inner.pop_request(connection_id, false);
+                    if let Some(mut request) = request {
+                        let _ = request.try_set_ok(HttpTask::Response(response));
+                    }
 
                     return Ok(());
                 }
