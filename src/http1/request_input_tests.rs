@@ -41,7 +41,8 @@ fn is_forbidden_in_path(c: char) -> bool {
 fn header_errors(name: &str, value: &str) -> [Option<RequestBuildError>; 3] {
     [
         MyHttpRequestBuilder::new(Method::GET, "/")
-            .and_then(|mut builder| builder.append_header(name, value))
+            .append_header(name, value)
+            .build()
             .err(),
         MyHttpClientHeadersBuilder::new()
             .add_header(name, value)
@@ -61,7 +62,7 @@ fn request_builder_refuses_cr_lf_nul_and_space_in_the_path() {
             None
         };
 
-        let error = MyHttpRequestBuilder::new(Method::GET, &path).err();
+        let error = MyHttpRequestBuilder::new(Method::GET, &path).build().err();
 
         assert_eq!(error, expected, "path with {:?}", c);
     }
@@ -165,14 +166,27 @@ fn a_header_which_is_refused_leaves_nothing_behind() {
     let mut headers = host_header();
     assert!(headers.add_header("x-name", "bad\nvalue").is_err());
     assert_eq!(headers.as_str(), "host: localhost\r\n");
+}
 
-    let mut builder = MyHttpRequestBuilder::new(Method::GET, "/path").unwrap();
-    assert!(builder.append_header("x-name", "bad\nvalue").is_err());
-    builder.append_header("host", "localhost").unwrap();
-    assert_eq!(
-        builder.build().headers,
-        b"GET /path HTTP/1.1\r\nhost: localhost\r\n"
-    );
+/// A step the request builder can not take does not fail on its own: the builder keeps
+/// the first error it meets, skips every step after it, and the build returns that error
+#[test]
+fn the_request_builder_returns_its_first_error_from_the_build() {
+    let builder = MyHttpRequestBuilder::new(Method::GET, "/path")
+        .append_header("host", "localhost")
+        .append_header("x-name", "bad\nvalue")
+        .append_header("bad name", "value")
+        .append_header("x-other", "value");
+
+    let expected = RequestBuildError::ForbiddenByteInHeaderValue(b'\n');
+    assert_eq!(builder.get_error(), Some(&expected));
+    assert_eq!(builder.build().err(), Some(expected));
+
+    let error = MyHttpRequestBuilder::new(Method::POST, "/a b")
+        .append_header("bad name", "value")
+        .build_with_body(b"body".to_vec())
+        .err();
+    assert_eq!(error, Some(RequestBuildError::ForbiddenByteInPath(b' ')));
 }
 
 #[test]
@@ -188,10 +202,11 @@ fn a_header_which_is_taken_is_written_as_it_is() {
     assert_eq!(headers.as_str(), "X-Name: caf\u{e9}\r\n");
     assert_eq!(headers.get_value(&position), Some("caf\u{e9}"));
 
-    let mut builder = MyHttpRequestBuilder::new(Method::POST, "/path?a=1").unwrap();
-    builder.append_header("X-Name", "value").unwrap();
+    let builder =
+        MyHttpRequestBuilder::new(Method::POST, "/path?a=1").append_header("X-Name", "value");
+    assert_eq!(builder.get_error(), None);
     assert_eq!(
-        builder.build_with_body(b"body".to_vec()).headers,
+        builder.build_with_body(b"body".to_vec()).unwrap().headers,
         b"POST /path?a=1 HTTP/1.1\r\nX-Name: value\r\nContent-Length: 4\r\n"
     );
 }

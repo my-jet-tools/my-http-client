@@ -527,8 +527,8 @@ fn get_method_parses_serialized_request_line() {
         assert_eq!(req.get_method(), method, "MyHttpRequest::new path");
 
         let built = MyHttpRequestBuilder::new(method.clone(), "/path?x=1")
-            .unwrap()
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(built.get_method(), method, "MyHttpRequestBuilder path");
     }
 }

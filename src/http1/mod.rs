@@ -16,6 +16,7 @@ pub use my_http_response::*;
 mod my_http_request;
 pub use my_http_request::*;
 mod my_http_request_builder;
+mod my_http_request_builder_inner;
 
 mod my_http_client_connection_context;
 pub use my_http_client_connection_context::*;
