@@ -58,7 +58,7 @@ const CONTENT_LENGTH_HEADER_NAME: &str = "content-length";
 const TRANSFER_ENCODING_HEADER_NAME: &str = "transfer-encoding";
 
 pub const MAX_RESPONSE_BODY_SIZE: usize = 100 * 1024 * 1024;
-pub const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_CHUNK_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_RESPONSE_HEADERS_COUNT: usize = 256;
 
 /// Upper bound on consecutive interim (1xx) responses accepted before a final
