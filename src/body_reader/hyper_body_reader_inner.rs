@@ -7,14 +7,14 @@ use std::{
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use tokio::sync::Mutex;
 
-use super::{BodyChunk, RequestDeadline};
+use super::{BodyPiece, RequestDeadline};
 
 /// How the body of a response is read when hyper reads the connection - the HTTP/1.1
 /// client on top of hyper and the HTTP/2 one. It is a wrapper of hyper's `Incoming`:
 /// the body is taken from hyper frame by frame, with nothing in between.
 ///
 /// hyper gives the data of the body: the chunks of a chunked body are taken apart by
-/// the time it gets here, so the pieces are [`BodyChunk::Raw`] whatever the body was
+/// the time it gets here, so a piece is the data of a frame whatever the body was
 /// framed with.
 ///
 /// It is hyper which holds the body back while it is not read, the way the protocol
@@ -26,6 +26,8 @@ pub struct HyperBodyReaderInner {
     reading: Mutex<State>,
     content_length: Option<usize>,
     pub(crate) request_deadline: Option<RequestDeadline>,
+    /// The piece [`super::BodyReader::next_item`] has given last
+    pub(crate) current: Option<BodyPiece>,
 }
 
 enum State {
@@ -45,6 +47,7 @@ impl HyperBodyReaderInner {
             reading: Mutex::new(State::Reading(body)),
             content_length,
             request_deadline: None,
+            current: None,
         }
     }
 
@@ -66,13 +69,13 @@ impl HyperBodyReaderInner {
     pub(crate) fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<BodyChunk>, String>>> {
+    ) -> Poll<Option<Result<Frame<BodyPiece>, String>>> {
         self.reading.get_mut().poll_frame(cx)
     }
 
     /// The next frame for a reader which shares the body. The readers take turns: the
     /// one which is waiting for a frame holds the others back until it has got it
-    pub(crate) async fn next_frame(&self) -> Option<Result<Frame<BodyChunk>, String>> {
+    pub(crate) async fn next_frame(&self) -> Option<Result<Frame<BodyPiece>, String>> {
         let mut reading = self.reading.lock().await;
         poll_fn(|cx| reading.poll_frame(cx)).await
     }
@@ -98,7 +101,7 @@ impl State {
     fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<BodyChunk>, String>>> {
+    ) -> Poll<Option<Result<Frame<BodyPiece>, String>>> {
         let body = match self {
             State::Reading(body) => body,
             State::Over => return Poll::Ready(None),
@@ -106,7 +109,7 @@ impl State {
         };
 
         let result = match ready!(Pin::new(body).poll_frame(cx)) {
-            Some(Ok(frame)) => Some(Ok(frame.map_data(BodyChunk::Raw))),
+            Some(Ok(frame)) => Some(Ok(frame.map_data(BodyPiece::hyper))),
             Some(Err(err)) => {
                 let reason = format!("The response body is not complete: {}", err);
                 *self = State::Failed(reason.clone());

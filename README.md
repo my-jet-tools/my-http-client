@@ -268,8 +268,8 @@ the response is an `http::Response<BodyReader>`, and the body is read through th
 let (head, mut body) = response.into_parts();
 
 // piece by piece, as it comes over the network - `None` is the end of the body
-while let Some(piece) = body.next_item().await? {
-    // BodyChunk: piece.as_slice() is the data of the body
+while let Some(data) = body.next_item().await? {
+    // &[u8]: the data of the body - good until the next call
 }
 
 // or the whole of it - what is left of it, when a part is taken by next_item already.
@@ -279,7 +279,7 @@ let body: Vec<u8> = body.into_vec(10 * 1024 * 1024).await?;
 
 | | `next_item()` | `into_vec(max_size)` |
 | --- | --- | --- |
-| gives | the next piece, as it came off the socket - a `BodyChunk` | the data of the whole body |
+| gives | the data which has come next - a `&[u8]`, good until the next call | the data of the whole body |
 | held in memory | the pieces waiting to be taken | the body, up to `max_size` - a bigger one is refused |
 | bounded in time by | nothing but the silence of the upstream (see below) | the `request_timeout` the request was sent with |
 
@@ -298,77 +298,51 @@ connection is closed.
 
 A body which is cut short - the connection is closed, the framing is broken - ends with an error
 (`The response body is not complete: ...`) and keeps answering with it, so a part of a body never
-passes for a whole one. The request is not sent again: its head is with the caller already, and
-replaying it is the caller's decision.
+passes for a whole one. What has come before the break is given first. The request is not sent
+again: its head is with the caller already, and replaying it is the caller's decision.
 
-`BodyReader` is a `hyper::body::Body` as well, so it can be handed to hyper as it is, or boxed into
-a `HyperResponse` - `MyHttpResponse::into_response()` does that. It reports the exact size of what
-is left when the response has a `content-length`, and carries the trailers of an HTTP/2 response,
-which `next_item` and `into_vec` read past. hyper gets the data of the body: it frames what it
-sends on its own.
+`BodyReader` is a `hyper::body::Body` as well, its data being a `BodyPiece`, so it can be handed to
+hyper as it is. `MyHttpResponse::into_response()` boxes it into a `HyperResponse`, whose body is
+made of `Bytes`: a piece goes into the `Bytes` as it is, with no copy. It reports the exact size of
+what is left when the response has a `content-length`, and carries the trailers of an HTTP/2
+response, which `next_item` and `into_vec` read past.
 
-### `BodyChunk`: the data, and the bytes as they have come
+### A piece: the data, not a copy
 
-A piece `next_item()` gives is a `BodyChunk`. It is held the way it has come over the network, and
-gives both what has come and the data of the body which is in it:
+A piece is the data of the body - for a chunked body the data of its chunks, with what framed them
+cut off: the sizes of the chunks, their separators, the chunk which ends the body and the trailers.
+A piece of the non-hyper client is what one read of the connection has brought, so the chunks
+which come in one read are one piece; a chunk does not have to be complete to be given - a big one
+comes in several pieces. There is no piece with no data in it.
 
-| | the data of the body | as it has come |
-| --- | --- | --- |
-| to look at | `as_slice()` | `as_raw_slice()` |
-| to take as `Bytes`, with no copy | `into_bytes()` | `into_raw_bytes()` |
-| to take as a `Vec` of its own | `into_vec()` | `into_raw()` |
+**A piece is not a copy of what was read off the socket.** It is the very buffer the socket is read
+into - nothing is allocated and nothing is copied on the way from the socket to the reader. That
+buffer is read into again once the piece is let go of, so `next_item()` gives a piece which is good
+until the next call: the call lets go of it. What is needed for longer is copied out of it.
 
-**A piece is not a copy of what was read off the socket.** It shares the buffer the socket was
-read into, and so does a `Bytes` taken out of it - nothing is allocated and nothing is copied on
-the way from the socket to the reader. That buffer is read into again once every piece of it is
-dropped, so a piece is meant to be used and dropped. What has to be kept for long is better taken
-as a `Vec`: it is a copy of its own and holds nothing else.
-
-| case | when | `as_slice()` vs `as_raw_slice()` |
-| --- | --- | --- |
-| `BodyChunk::Raw` | the body has a `content-length` or lasts until the connection is closed - and any body read by hyper | the same bytes |
-| `BodyChunk::Chunked` | a chunked body of the non-hyper client | the raw bytes are the chunked coding as it is on the wire; the data is the part of them between the size of the chunk and its separator |
-
-A `Chunked` piece has its data in one place: it is some data of one chunk with what frames it - the
-size of the chunk before it when the chunk begins there, the separator behind it when it ends
-there. So `as_slice()` is a slice of what `as_raw_slice()` gives, with no copy, and `into_vec()`
-cuts the framing off. A chunk does not have to be complete to be given: a big one comes in several
-pieces, as it is read off the socket.
-
-The raw bytes of the pieces put together are the body exactly as the upstream has sent it - with
-the chunk of no size which ends it, and the trailers. That last piece is the only one with no data.
-What frames the data is never a piece on its own: the size of a chunk waits for the first byte of
-its data.
-
-```rust
-while let Some(piece) = body.next_item().await? {
-    match &piece {
-        // Already framed by the upstream: goes on as it is
-        BodyChunk::Chunked(_) => downstream.write_all(piece.as_raw_slice()).await?,
-        BodyChunk::Raw(_) => downstream.write_all(piece.as_slice()).await?,
-    }
-}
-```
+The trait below and hyper take a piece as a `BodyPiece` of their own - a `&[u8]` through `Deref`,
+which holds its buffer until it is dropped.
 
 ### Nothing but the bytes: `AsyncBytesStream`
 
 Whoever needs the bytes of the body and nothing else reads it as a
 `rust_extensions::AsyncBytesStream<MyHttpClientError>`, which `BodyReader` is as well. Its chunk is a
-`Bytes`:
+`BodyPiece`:
 
 ```rust
 use rust_extensions::AsyncBytesStream;
 
-let body: Arc<dyn AsyncBytesStream<MyHttpClientError, Chunk = Bytes> + Send + Sync> = Arc::new(body);
+let body: Arc<dyn AsyncBytesStream<MyHttpClientError, Chunk = BodyPiece> + Send + Sync> =
+    Arc::new(body);
 
-while let Some(bytes) = body.get_next().await? {
-    // Bytes: the data of the body, as it came over the network - it is not copied
+while let Some(piece) = body.get_next().await? {
+    // BodyPiece: the data of the body, as it came over the network - it is not copied
 }
 ```
 
 | the trait | gives |
 | --- | --- |
-| `get_next()` | the data of the next piece - what a chunked body is framed with is left out, the piece which has no data is not given, the trailers of an HTTP/2 response are read past |
+| `get_next()` | the next piece - the same data `next_item()` gives; the trailers of an HTTP/2 response are read past |
 | `get_size()` | `content_length()`: the size of the whole body when the response says it |
 | `into_vec()` | the data of the whole body - what is left of it, when a part is read already. It is the one the trait comes with, made of the two above |
 
@@ -409,8 +383,8 @@ goes on with the body, writing it to the `BodySender` whatever the framing is:
 
 | framing | what is sent |
 | --- | --- |
-| `content-length` | what a read() of the socket has brought, until that many bytes are sent |
-| `transfer-encoding: chunked` | the same, as it is on the wire - a `BodyChunk::Chunked` piece, see above |
+| `content-length` | what a read() of the socket has brought, until that many bytes are sent - nothing past the end of the body is read |
+| `transfer-encoding: chunked` | the data of the chunks a read() has brought, moved together over what framed them |
 | neither of them | what a read() has brought, until the upstream closes the connection |
 
 A piece is `MAX_RESPONSE_BODY_PIECE_SIZE` (64 KB) at most, and a chunk does not have to be complete
@@ -419,34 +393,35 @@ long ends with an error. The read loop ends the body explicitly; a sender which 
 leaves a body which is not complete, so a read loop which is gone can not pass for the end of a
 body.
 
-**The socket is read into the two buffers of a `DoubleBuffer`, in turns.** It is the one of
-`rust-extensions`: a buffer is handed out to be read into, what is read goes on as a chunk, and the
-buffer is free again once the chunk is dropped. A piece of the body is not copied out of the chunk:
-it shares the buffer, so the buffer is free once every piece of it is dropped. While the reader is
-busy with the pieces of one buffer, the socket is read into the other - the two go on at the same
-time. With a reader which uses a piece and drops it, a body of any size goes through the same two
-buffers of 64 KB: nothing else is allocated for it, and nothing is copied. A read takes a buffer as
-a whole, however little it brings.
+**The heads and the bodies are read into buffers of their own.** A head is read into a buffer of
+64 KB and parsed there, line by line - a head of any size, as long as a single line fits into the
+buffer. A body is read into the two buffers of a `DoubleBuffer` of `rust-extensions`, in turns: a
+buffer is read into, the part of it which is the data goes to the reader as it is - `send_range()`
+cuts off what framed it - and the buffer is free again once the reader lets go of the piece. While
+the reader is busy with one piece, the socket is read into the other buffer - the two go on at the
+same time. A body of any size goes through the same two buffers: nothing else is allocated for it,
+and nothing is copied.
 
-What is not consumed yet - a line which is not complete, the beginning of the head which is next -
-goes to the beginning of the buffer which is read into next, so that what is parsed is one run of
-bytes. That is the only copy, and it is a few bytes as a rule. A head of any size is read line by
-line; a single line which does not fit into a buffer is refused.
+What of a read is not the body goes to the buffer of the heads: the beginning of the next response
+which has come along with the end of a chunked body, a line of the framing which the read has cut -
+the read after it completes the line. What has come along with a head, past its end, is the
+beginning of the body: it is copied into a buffer of the body, and that is the first piece.
 
 **The body is not piled up in the client.** When the second buffer is read and the reader is not
 done with the first, there is nowhere to read into: the socket is left alone until the reader lets
 go of a buffer, and that buffer is what is read into next. So a body nobody is in a hurry to read
-stays with the upstream - however big it is - and what is in memory is the two buffers. This client
-pipelines, so that has a price: **the connection is busy with a body until it is read**, and the
-responses to the requests issued meanwhile wait for that. A body which is off the wire holds the
-buffers it was read into all the same: while it holds both of them, the next response waits for it
-to be read.
+stays with the upstream - however big it is - and what is in memory is the buffers. This client
+pipelines, so that has a price: **the connection is busy with a body until it is off the wire**,
+and the responses to the requests issued meanwhile wait for that. A body which is off the wire
+holds the buffers it was read into all the same: the head of the next response is read into its own
+buffer and handed over, but its body waits for the first one to be read.
 
-**A reader lets go of a piece before it asks for the one after the next.** It copies the piece into
-a `Vec`, parses it as it reads, or passes it on - and drops it. It may keep the piece it has while it
-asks for the next one, but a reader which keeps the pieces of both buffers and asks for more waits
-for ever: nothing is read until a buffer is free. `collect()` of hyper is such a reader for a body
-which does not fit into the two buffers.
+**A reader lets go of a piece before it asks for the one after the next.** `next_item()` does it on
+its own. A reader of `BodyPiece`s - the trait, hyper - copies the piece, parses it as it reads, or
+passes it on, and drops it. It may keep the piece it has while it asks for the next one, but a
+reader which keeps the pieces of both buffers and asks for more waits for ever: nothing is read
+until a buffer is free. `collect()` of hyper is such a reader for a body which does not fit into the
+two buffers.
 
 Dropping the reader before the end of the body lets the connection go. What is left of the body is
 read past - up to `MAX_ABANDONED_BODY_SIZE` (1 MB), for `ABANDONED_BODY_SKIP_TIMEOUT` (1 second) -

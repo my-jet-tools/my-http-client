@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use http::Method;
-use http_body_util::{combinators::BoxBody, BodyExt};
+use http_body_util::combinators::BoxBody;
 use parking_lot::Mutex;
 use rust_extensions::{TaskCompletion, TaskCompletionAwaiter};
 use tokio::io::ReadHalf;
@@ -37,7 +37,7 @@ pub enum HttpTask<TStream: tokio::io::AsyncRead + Send + Sync + 'static> {
 impl<TStream: tokio::io::AsyncRead + Send + Sync + 'static> HttpTask<TStream> {
     pub fn unwrap_response(self) -> hyper::Response<BoxBody<Bytes, String>> {
         match self {
-            HttpTask::Response(response) => response.map(|body| body.boxed()),
+            HttpTask::Response(response) => response.map(BodyReader::into_bytes_body),
             HttpTask::WebsocketUpgrade { response, .. } => response,
         }
     }

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use http::{HeaderMap, StatusCode};
-use http_body_util::BodyExt;
 
 use crate::{BodyReader, MyHttpClientDisconnect};
 
@@ -51,7 +50,7 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
     /// still comes frame by frame, as it is read off the socket
     pub fn into_response(self) -> crate::HyperResponse {
         match self {
-            MyHttpResponse::Response(response) => response.map(|body| body.boxed()),
+            MyHttpResponse::Response(response) => response.map(BodyReader::into_bytes_body),
             MyHttpResponse::WebSocketUpgrade { response, .. } => response,
         }
     }

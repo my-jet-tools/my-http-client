@@ -10,7 +10,6 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use bytes::Bytes;
 use hyper::body::Body;
 use tokio::{
     io::AsyncWriteExt,
@@ -18,7 +17,7 @@ use tokio::{
     sync::oneshot,
 };
 
-use crate::{BodyChunk, BodyReader, MyHttpClientError};
+use crate::{BodyPiece, BodyReader, MyHttpClientError};
 
 use super::response_input_tests::{
     client_of_an_upstream_answering, get_request, read_request_heads, Then,
@@ -136,18 +135,15 @@ async fn read_exactly(body: &mut BodyReader, size: usize) -> Vec<u8> {
 
     while result.len() < size {
         let piece = body.next_item().await.unwrap();
-        result.extend_from_slice(piece.expect("The body is over before its time").as_slice());
+        result.extend_from_slice(piece.expect("The body is over before its time"));
     }
 
     result
 }
 
-/// Reads the body to its end. All the data is read by now, so what is left has none: a
-/// chunked body ends with a piece which carries no data
+/// Reads the body to its end. All the data is read by now: the body is over
 async fn read_to_the_end(body: &mut BodyReader) {
-    while let Some(piece) = body.next_item().await.unwrap() {
-        assert!(piece.as_slice().is_empty());
-    }
+    assert!(body.next_item().await.unwrap().is_none());
 
     // A body which is over stays over
     assert!(body.next_item().await.unwrap().is_none());
@@ -329,8 +325,6 @@ async fn a_body_nobody_reads_stays_with_the_upstream() {
     let mut received = 0;
 
     while let Some(piece) = body.next_item().await.unwrap() {
-        let piece = piece.as_slice();
-
         assert!(piece.len() <= MAX_RESPONSE_BODY_PIECE_SIZE);
         assert!(piece == &expected[received..received + piece.len()]);
         received += piece.len();
@@ -902,33 +896,37 @@ async fn a_sender_which_is_dropped_without_a_word_leaves_a_body_which_is_not_com
 
     let (sender, mut body) = BodyReader::new(None);
 
-    assert!(sender.send(raw(b"Hello")).await);
+    assert!(sender.send(piece_of(b"Hello")).await);
     drop(sender);
 
-    assert_eq!(
-        body.next_item().await.unwrap().unwrap().as_slice(),
-        b"Hello"
-    );
+    assert_eq!(body.next_item().await.unwrap().unwrap(), b"Hello");
     assert_eq!(error_of(body.next_item().await), NOT_COMPLETE);
     assert_eq!(error_of(body.into_vec(NO_LIMIT).await), NOT_COMPLETE);
 
     let (sender, mut body) = BodyReader::new(None);
 
-    assert!(sender.send(raw(b"Hello")).await);
+    assert!(sender.send(piece_of(b"Hello")).await);
     sender.complete().await;
 
-    assert_eq!(
-        body.next_item().await.unwrap().unwrap().as_slice(),
-        b"Hello"
-    );
+    assert_eq!(body.next_item().await.unwrap().unwrap(), b"Hello");
     assert!(!body.is_end_stream());
 
     assert!(body.next_item().await.unwrap().is_none());
     assert!(body.is_end_stream());
 }
 
-fn raw(data: &'static [u8]) -> BodyChunk {
-    Bytes::from_static(data).into()
+/// A piece the way the read loop sends it: `data` is read into a buffer of a
+/// `DoubleBuffer` - one of its own
+fn piece_of(data: &[u8]) -> rust_extensions::DoubleBufferChunk {
+    use futures::FutureExt;
+
+    let (writer, reader) = rust_extensions::DoubleBuffer::new(data.len());
+
+    let mut buffer = writer.get_buffer_to_read().now_or_never().unwrap().unwrap();
+    buffer[..data.len()].copy_from_slice(data);
+    buffer.send(data.len());
+
+    reader.get_next().now_or_never().unwrap().unwrap().unwrap()
 }
 
 /// The reader counts what it has given against the size the body was made with
@@ -936,17 +934,14 @@ fn raw(data: &'static [u8]) -> BodyChunk {
 async fn a_body_reader_knows_how_much_of_a_body_of_a_known_size_is_left() {
     let (sender, mut body) = BodyReader::new(Some(10));
 
-    assert!(sender.send(raw(b"Hello")).await);
-    assert!(sender.send(raw(b"World")).await);
+    assert!(sender.send(piece_of(b"Hello")).await);
+    assert!(sender.send(piece_of(b"World")).await);
     sender.complete().await;
 
     assert_eq!(body.content_length(), Some(10));
     assert_eq!(body.remains_to_read(), Some(10));
 
-    assert_eq!(
-        body.next_item().await.unwrap().unwrap().as_slice(),
-        b"Hello"
-    );
+    assert_eq!(body.next_item().await.unwrap().unwrap(), b"Hello");
     assert_eq!(body.remains_to_read(), Some(5));
 
     assert_eq!(body.into_vec(NO_LIMIT).await.unwrap(), b"World");
@@ -958,60 +953,29 @@ async fn a_body_reader_knows_how_much_of_a_body_of_a_known_size_is_left() {
 async fn a_sender_is_told_when_the_reader_is_dropped() {
     let (sender, body) = BodyReader::new(None);
 
-    assert!(sender.send(raw(b"Hello")).await);
+    assert!(sender.send(piece_of(b"Hello")).await);
     drop(body);
 
     sender.reader_is_dropped().await;
-    assert!(!sender.send(raw(b"World")).await);
-}
-
-/// A piece gives the data of the body and the bytes as they have come. For a raw piece
-/// they are the same bytes; for a chunked one the data is what is between the size of
-/// the chunk and its separator
-#[test]
-fn a_body_chunk_gives_the_data_and_the_bytes_as_they_have_come() {
-    let piece = raw(b"Hello");
-
-    assert_eq!(piece.as_slice(), b"Hello");
-    assert_eq!(piece.as_raw_slice(), b"Hello");
-    assert_eq!(piece.clone().into_vec(), b"Hello");
-    assert_eq!(piece.into_raw(), b"Hello");
-
-    let piece = BodyChunk::chunked(Bytes::from_static(b"5\r\nHello\r\n"), 3..8);
-
-    assert_eq!(piece.as_slice(), b"Hello");
-    assert_eq!(piece.as_raw_slice(), b"5\r\nHello\r\n");
-    assert_eq!(piece.clone().into_vec(), b"Hello");
-    assert_eq!(piece.into_raw(), b"5\r\nHello\r\n");
-
-    // The chunk which ends a body has no data in it
-    let piece = BodyChunk::chunked(Bytes::from_static(b"0\r\n\r\n"), 5..5);
-
-    assert!(piece.as_slice().is_empty());
-    assert_eq!(piece.as_raw_slice(), b"0\r\n\r\n");
-    assert!(piece.clone().into_vec().is_empty());
-    assert_eq!(piece.into_raw(), b"0\r\n\r\n");
+    assert!(!sender.send(piece_of(b"World")).await);
 }
 
 /// All the pieces of a body, to its end
-async fn all_the_pieces(body: &mut BodyReader) -> Vec<BodyChunk> {
+async fn all_the_pieces(body: &mut BodyReader) -> Vec<Vec<u8>> {
     let mut result = Vec::new();
 
     while let Some(piece) = body.next_item().await.unwrap() {
-        result.push(piece);
+        result.push(piece.to_vec());
     }
 
     result
 }
 
-/// A chunked body comes the way it is on the wire: put together the pieces are exactly
-/// what the upstream has sent - the sizes of the chunks, their separators, the chunk
-/// which ends the body and the trailers - and the data of the body is in them
+/// A chunked body comes as its data: the sizes of the chunks, their separators, the
+/// chunk which ends the body and the trailers are cut off. There is no piece with no
+/// data in it
 #[tokio::test]
-async fn a_chunked_body_comes_as_it_is_on_the_wire() {
-    const BODY_ON_THE_WIRE: &[u8] =
-        b"5\r\nHello\r\n6;ext=1\r\n World\r\n0\r\nX-Checksum: 1\r\n\r\n";
-
+async fn a_chunked_body_comes_as_its_data() {
     let client = client_of_an_upstream_answering(
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n6;ext=1\r\n World\r\n0\r\nX-Checksum: 1\r\n\r\n",
         Then::KeepOpen,
@@ -1021,30 +985,12 @@ async fn a_chunked_body_comes_as_it_is_on_the_wire() {
     let mut body = body_reader_of_a_request(&client).await;
     let pieces = all_the_pieces(&mut body).await;
 
-    let mut as_it_has_come = Vec::new();
-    let mut data = Vec::new();
-
-    for piece in &pieces {
-        assert!(matches!(piece, BodyChunk::Chunked(_)));
-
-        as_it_has_come.extend_from_slice(piece.as_raw_slice());
-        data.extend_from_slice(piece.as_slice());
-    }
-
-    assert_eq!(as_it_has_come, BODY_ON_THE_WIRE);
-    assert_eq!(data, b"Hello World");
-
-    // The data is never away from what frames it: the only piece with none is the
-    // one which ends the body
-    let (the_last_one, the_others) = pieces.split_last().unwrap();
-
-    assert!(the_last_one.as_slice().is_empty());
-    assert!(the_others.iter().all(|piece| !piece.as_slice().is_empty()));
+    assert!(pieces.iter().all(|piece| !piece.is_empty()));
+    assert_eq!(pieces.concat(), b"Hello World");
 }
 
 /// A chunk does not have to be complete to be given: its data comes as it is read off
-/// the socket, and each piece has it in one place - with the size of the chunk before
-/// it when the chunk begins there, with the separator behind it when it ends there
+/// the socket
 #[tokio::test]
 async fn a_chunk_which_comes_in_parts_is_given_in_parts() {
     let (first, second, then) = BODIES_IN_TWO_PARTS[1];
@@ -1054,23 +1000,11 @@ async fn a_chunk_which_comes_in_parts_is_given_in_parts() {
 
     let mut body = body_reader_of_a_request(&client).await;
 
-    let piece = body.next_item().await.unwrap().unwrap();
-
-    assert_eq!(piece.as_raw_slice(), b"a\r\nHello");
-    assert_eq!(piece.as_slice(), b"Hello");
+    assert_eq!(body.next_item().await.unwrap().unwrap(), b"Hello");
 
     send_the_second_part.send(()).unwrap();
 
-    let piece = body.next_item().await.unwrap().unwrap();
-
-    assert_eq!(piece.as_raw_slice(), b"World\r\n");
-    assert_eq!(piece.as_slice(), b"World");
-
-    let piece = body.next_item().await.unwrap().unwrap();
-
-    assert_eq!(piece.as_raw_slice(), b"0\r\n\r\n");
-    assert!(piece.as_slice().is_empty());
-
+    assert_eq!(body.next_item().await.unwrap().unwrap(), b"World");
     assert!(body.next_item().await.unwrap().is_none());
 }
 
@@ -1092,16 +1026,68 @@ async fn the_size_of_a_chunk_waits_for_its_data() {
 
     send_the_second_part.send(()).unwrap();
 
-    let piece = body.next_item().await.unwrap().unwrap();
-
-    assert_eq!(piece.as_raw_slice(), b"5\r\nHello\r\n");
-    assert_eq!(piece.as_slice(), b"Hello");
+    assert_eq!(body.next_item().await.unwrap().unwrap(), b"Hello");
 }
 
-/// A body which is not chunked has nothing but its data on the wire, so its pieces are
-/// raw: what has come is the data
+/// A reader may keep the piece it has while it asks for the next one, wherever the reads
+/// cut the frames of the body. Here the size of the third chunk comes in a read of its
+/// own and its CRLF in the read after: the size waits for its data in the buffer of the
+/// heads, and holds none of the two buffers of the body while the reader holds one
 #[tokio::test]
-async fn a_body_which_is_not_chunked_comes_raw() {
+async fn a_reader_which_keeps_the_piece_it_has_gets_the_next_one_wherever_the_reads_cut_the_body(
+) {
+    use rust_extensions::AsyncBytesStream;
+
+    const PARTS: [&[u8]; 4] = [
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n",
+        b"5\r\nWorld\r\n",
+        b"1",
+        b"\r\n!\r\n0\r\n\r\n",
+    ];
+
+    let (listener, client) = upstream().await;
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.set_nodelay(true).unwrap();
+        read_request_heads(&mut socket, 1).await;
+
+        // A part at a time, so that each of them is a read of its own
+        for part in PARTS {
+            socket.write_all(part).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let body = body_reader_of_a_request(&client).await;
+
+    let read = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let mut data = Vec::new();
+        let mut kept = None;
+
+        while let Some(piece) = body.get_next().await.unwrap() {
+            data.extend_from_slice(&piece);
+
+            // The piece before is let go of once this one is here
+            kept = Some(piece);
+        }
+
+        drop(kept);
+        data
+    })
+    .await;
+
+    assert_eq!(
+        read.expect("The reader which keeps the piece it has waits for ever"),
+        b"HelloWorld!"
+    );
+}
+
+/// A body which is not chunked has nothing but its data on the wire: it comes as it is
+#[tokio::test]
+async fn a_body_which_is_not_chunked_comes_as_it_is() {
     let responses: [(&'static [u8], Then); 2] = [
         (
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello",
@@ -1114,25 +1100,18 @@ async fn a_body_which_is_not_chunked_comes_raw() {
         let client = client_of_an_upstream_answering(response, then).await;
 
         let mut body = body_reader_of_a_request(&client).await;
-        let pieces = all_the_pieces(&mut body).await;
 
-        let mut data = Vec::new();
-
-        for piece in &pieces {
-            assert!(matches!(piece, BodyChunk::Raw(_)));
-            assert_eq!(piece.as_raw_slice(), piece.as_slice());
-
-            data.extend_from_slice(piece.as_slice());
-        }
-
-        assert_eq!(data, b"Hello");
+        assert_eq!(all_the_pieces(&mut body).await.concat(), b"Hello");
     }
 }
 
 /// The body as `rust_extensions::AsyncBytesStream` sees it: a source of bytes, read
 /// through a shared reference by whoever holds it
 type BytesStream = Arc<
-    dyn rust_extensions::AsyncBytesStream<MyHttpClientError, Chunk = Bytes> + Send + Sync + 'static,
+    dyn rust_extensions::AsyncBytesStream<MyHttpClientError, Chunk = BodyPiece>
+        + Send
+        + Sync
+        + 'static,
 >;
 
 /// Whoever reads the body as bytes gets its data and nothing else - whatever it is
@@ -1154,7 +1133,7 @@ async fn a_body_reader_is_an_async_bytes_stream() {
         let mut the_first_half = Vec::new();
 
         while the_first_half.len() < 5 {
-            the_first_half.extend(body.get_next().await.unwrap().unwrap());
+            the_first_half.extend_from_slice(&body.get_next().await.unwrap().unwrap());
         }
 
         assert_eq!(the_first_half, b"Hello");
@@ -1164,10 +1143,9 @@ async fn a_body_reader_is_an_async_bytes_stream() {
         let the_rest = tokio::spawn(async move {
             let mut result = Vec::new();
 
-            while let Some(bytes) = body.get_next().await.unwrap() {
-                // The piece which ends a chunked body has no data, and is not given
-                assert!(!bytes.is_empty());
-                result.extend(bytes);
+            while let Some(piece) = body.get_next().await.unwrap() {
+                assert!(!piece.is_empty());
+                result.extend_from_slice(&piece);
             }
 
             // A body which is over stays over
@@ -1204,7 +1182,7 @@ async fn an_async_bytes_stream_gives_the_whole_body() {
         let mut the_first_half = Vec::new();
 
         while the_first_half.len() < 5 {
-            the_first_half.extend(body.get_next().await.unwrap().unwrap());
+            the_first_half.extend_from_slice(&body.get_next().await.unwrap().unwrap());
         }
 
         send_the_second_part.send(()).unwrap();
@@ -1225,7 +1203,7 @@ async fn an_async_bytes_stream_ends_a_body_which_is_cut_short_with_an_error() {
     let client = client_of_an_upstream_answering(response, Then::Close).await;
     let body: BytesStream = Arc::new(body_reader_of_a_request(&client).await);
 
-    assert_eq!(body.get_next().await.unwrap().unwrap(), &b"Hello"[..]);
+    assert_eq!(&*body.get_next().await.unwrap().unwrap(), b"Hello");
     assert_eq!(error_of(body.get_next().await), NOT_COMPLETE);
     assert_eq!(error_of(body.get_next().await), NOT_COMPLETE);
 
@@ -1283,41 +1261,36 @@ async fn a_body_read_as_bytes_knows_how_much_of_it_is_left() {
 
     let (sender, body) = BodyReader::new(Some(10));
 
-    assert!(sender.send(raw(b"Hello")).await);
-    assert!(sender.send(raw(b"World")).await);
+    assert!(sender.send(piece_of(b"Hello")).await);
+    assert!(sender.send(piece_of(b"World")).await);
     sender.complete().await;
 
     assert_eq!(body.get_size(), Some(10));
     assert_eq!(body.remains_to_read(), Some(10));
 
-    assert_eq!(body.get_next().await.unwrap().unwrap(), &b"Hello"[..]);
+    assert_eq!(&*body.get_next().await.unwrap().unwrap(), b"Hello");
     assert_eq!(body.remains_to_read(), Some(5));
 
     // What is left is read the other way, with a limit
     assert_eq!(body.into_vec(NO_LIMIT).await.unwrap(), b"World");
 }
 
-/// What a piece gives as `Bytes` is not a copy either: it is the same buffer the piece
-/// has come in
+/// hyper takes a piece as a `Buf`: what it has taken of it is not given again, and the
+/// rest is still the buffer the piece is read into
 #[test]
-fn a_body_chunk_gives_bytes_which_share_its_buffer() {
-    let piece = raw(b"Hello");
-    let data = piece.as_slice().as_ptr();
+fn hyper_takes_a_piece_bit_by_bit() {
+    use bytes::Buf;
 
-    assert_eq!(piece.clone().into_bytes(), "Hello");
-    assert_eq!(piece.clone().into_bytes().as_ptr(), data);
-    assert_eq!(piece.clone().into_raw_bytes().as_ptr(), data);
+    let mut piece = BodyPiece::read(piece_of(b"HelloWorld"));
+    let data = piece.as_ptr();
 
-    let piece = BodyChunk::chunked(Bytes::from_static(b"5\r\nHello\r\n"), 3..8);
+    assert_eq!(piece.remaining(), 10);
 
-    let data = piece.as_slice().as_ptr();
-    let as_it_has_come = piece.as_raw_slice().as_ptr();
+    piece.advance(5);
 
-    assert_eq!(piece.clone().into_bytes(), "Hello");
-    assert_eq!(piece.clone().into_bytes().as_ptr(), data);
-
-    assert_eq!(piece.clone().into_raw_bytes(), "5\r\nHello\r\n");
-    assert_eq!(piece.into_raw_bytes().as_ptr(), as_it_has_come);
+    assert_eq!(piece.remaining(), 5);
+    assert_eq!(piece.chunk(), b"World");
+    assert_eq!(piece.chunk().as_ptr(), data.wrapping_add(5));
 }
 
 /// A connection which never runs dry: the head of a response too big to be read to the
@@ -1485,7 +1458,7 @@ async fn the_body_of_an_endless_response() -> (BodyReader, Arc<AtomicUsize>, Rea
 /// reader and no further, however much the upstream has to give. While the reader is
 /// busy with one buffer the socket is read into the other, and with both of them read
 /// it is left alone until the reader is done with the first - that buffer is what is
-/// read into next
+/// read into next. The piece `next_item` gives is the reader's until the next call
 #[tokio::test]
 async fn the_socket_is_read_two_buffers_ahead_of_the_reader_and_no_further() {
     const BUFFER_SIZE: usize = MAX_RESPONSE_BODY_PIECE_SIZE;
@@ -1497,13 +1470,11 @@ async fn the_socket_is_read_two_buffers_ahead_of_the_reader_and_no_further() {
 
     let read_ahead = read_off_the_socket.load(Ordering::SeqCst);
 
-    assert!(read_ahead > BUFFER_SIZE);
-    assert!(read_ahead <= 2 * BUFFER_SIZE);
+    assert_eq!(read_ahead, 2 * BUFFER_SIZE);
 
     // The reader is busy with the first piece. Its buffer is not free, and the second
     // one is read already: there is nowhere to read into
-    let first = body.next_item().await.unwrap().unwrap();
-    let mut taken = first.as_slice().len();
+    let mut taken = body.next_item().await.unwrap().unwrap().len();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1511,31 +1482,27 @@ async fn the_socket_is_read_two_buffers_ahead_of_the_reader_and_no_further() {
 
     // It is done with it and goes on with the second one: the buffer it has let go of
     // is read into meanwhile - and there is nowhere to read into again
-    drop(first);
-
-    let second = body.next_item().await.unwrap().unwrap();
-    taken += second.as_slice().len();
+    taken += body.next_item().await.unwrap().unwrap().len();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let read_so_far = read_off_the_socket.load(Ordering::SeqCst);
+    assert_eq!(
+        read_off_the_socket.load(Ordering::SeqCst),
+        read_ahead + BUFFER_SIZE
+    );
 
-    assert!(read_so_far > read_ahead);
-    assert!(read_so_far <= read_ahead + BUFFER_SIZE);
-
-    drop(second);
-
-    // And so it goes: whatever the reader takes, two buffers are read ahead of it
+    // And so it goes: whatever the reader takes, a buffer is read ahead of the piece
+    // it has, and that is all
     for _ in 0..10 {
-        taken += body.next_item().await.unwrap().unwrap().as_slice().len();
+        taken += body.next_item().await.unwrap().unwrap().len();
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let read_so_far = read_off_the_socket.load(Ordering::SeqCst);
-
-    assert!(read_so_far > taken + BUFFER_SIZE);
-    assert!(read_so_far <= taken + 2 * BUFFER_SIZE);
+    assert_eq!(
+        read_off_the_socket.load(Ordering::SeqCst),
+        taken + BUFFER_SIZE
+    );
 
     // Nobody needs the rest of it, and there is far too much of it to read past
     drop(body);
@@ -1547,30 +1514,29 @@ async fn the_socket_is_read_two_buffers_ahead_of_the_reader_and_no_further() {
         .unwrap();
 }
 
-/// The pieces are not copied out of the buffer the socket is read into, so a buffer of
-/// it can not be read into while its piece is alive. Two buffers are enough for a body
-/// of any size: while the reader has the piece of one the socket is read into the
-/// other, and by the time the reader takes that one it has dropped the first
+/// A piece is not copied out of the buffer the socket is read into, so a buffer can not
+/// be read into while its piece is alive. Two buffers are enough for a body of any size:
+/// while the reader has the piece of one the socket is read into the other, and by the
+/// time the reader takes that one it has dropped the first
 #[tokio::test]
 async fn a_body_of_any_size_is_read_through_the_same_two_buffers() {
-    let (mut body, _read_off_the_socket, read_loop) = the_body_of_an_endless_response().await;
+    use rust_extensions::AsyncBytesStream;
 
-    // The first buffer has the head of the response in it: the body begins further on
-    drop(body.next_item().await.unwrap().unwrap());
+    let (mut body, _read_off_the_socket, read_loop) = the_body_of_an_endless_response().await;
 
     let mut buffers = Vec::new();
 
     // The reader has a piece in its hands all the time: it takes the next one, and
     // only then lets go of the one it had
-    let mut reading = body.next_item().await.unwrap().unwrap();
+    let mut reading = body.get_next().await.unwrap().unwrap();
 
     for _ in 0..50 {
-        let next = body.next_item().await.unwrap().unwrap();
+        let next = body.get_next().await.unwrap().unwrap();
 
-        assert_eq!(reading.as_slice().len(), MAX_RESPONSE_BODY_PIECE_SIZE);
-        assert!(reading.as_slice().iter().all(|byte| *byte == 7));
+        assert_eq!(reading.len(), MAX_RESPONSE_BODY_PIECE_SIZE);
+        assert!(reading.iter().all(|byte| *byte == 7));
 
-        buffers.push(reading.as_slice().as_ptr() as usize);
+        buffers.push(reading.as_ptr() as usize);
 
         reading = next;
     }
@@ -1580,15 +1546,15 @@ async fn a_body_of_any_size_is_read_through_the_same_two_buffers() {
 
     assert_eq!(buffers.len(), 2);
 
-    // A reader which lets go of a piece before it takes the next one needs no second
-    // buffer at all: nothing new is allocated for it either
+    // `next_item` lets go of the piece it gave before it takes the next one, and the
+    // pieces come in the same two buffers
     drop(reading);
 
     for _ in 0..50 {
         let piece = body.next_item().await.unwrap().unwrap();
 
-        assert!(piece.as_slice().iter().all(|byte| *byte == 7));
-        assert!(buffers.contains(&(piece.as_slice().as_ptr() as usize)));
+        assert!(piece.iter().all(|byte| *byte == 7));
+        assert!(buffers.contains(&(piece.as_ptr() as usize)));
     }
 
     drop(body);
@@ -1601,17 +1567,16 @@ async fn a_body_of_any_size_is_read_through_the_same_two_buffers() {
 }
 
 /// The same with the reader and the read loop on threads of their own: nothing is in
-/// step there. A reader which lets go of a piece before it takes the next one still
-/// gets the body through the same two buffers, with two buffers read ahead of it at most
-/// and every piece intact while it is in its hands
+/// step there. The body still comes through the same two buffers, with a buffer read
+/// ahead of the piece the reader has at most and every piece intact while it is in its
+/// hands
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reader_on_a_thread_of_its_own_gets_the_body_through_the_same_two_buffers() {
     const BUFFER_SIZE: usize = MAX_RESPONSE_BODY_PIECE_SIZE;
 
     let (mut body, read_off_the_socket, read_loop) = the_body_of_an_endless_response().await;
 
-    // The first buffer has the head of the response in it: the body begins further on
-    let mut taken = body.next_item().await.unwrap().unwrap().as_slice().len();
+    let mut taken = 0;
 
     let mut buffers = Vec::new();
 
@@ -1622,14 +1587,14 @@ async fn a_reader_on_a_thread_of_its_own_gets_the_body_through_the_same_two_buff
             .unwrap()
             .unwrap();
 
-        taken += piece.as_slice().len();
+        taken += piece.len();
 
-        assert!(read_off_the_socket.load(Ordering::SeqCst) <= taken + 2 * BUFFER_SIZE);
+        assert!(read_off_the_socket.load(Ordering::SeqCst) <= taken + BUFFER_SIZE);
 
-        assert_eq!(piece.as_slice().len(), BUFFER_SIZE);
-        assert!(piece.as_slice().iter().all(|byte| *byte == 7));
+        assert_eq!(piece.len(), BUFFER_SIZE);
+        assert!(piece.iter().all(|byte| *byte == 7));
 
-        buffers.push(piece.as_slice().as_ptr() as usize);
+        buffers.push(piece.as_ptr() as usize);
     }
 
     buffers.sort();
@@ -1647,11 +1612,12 @@ async fn a_reader_on_a_thread_of_its_own_gets_the_body_through_the_same_two_buff
 }
 
 /// A body which is off the wire holds the buffers it was read into until it is read.
-/// Here it has both of them, full to the last byte, and the response which is next has
-/// nowhere to be read into: it waits for the body to be read, and comes in one of the
-/// same two buffers - nothing is allocated for it
+/// Here it has both of them, and the response which is next comes all the same: its
+/// head is read into a buffer of its own. Its body has nowhere to be read into: it waits
+/// for the first body to be read, and comes in one of the same two buffers - nothing is
+/// allocated for it
 #[tokio::test]
-async fn a_body_which_holds_both_buffers_holds_the_next_response_until_it_is_read() {
+async fn a_body_which_holds_both_buffers_holds_the_next_body_until_it_is_read() {
     const BUFFER_SIZE: usize = MAX_RESPONSE_BODY_PIECE_SIZE;
     const THE_SECOND_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
 
@@ -1685,11 +1651,12 @@ async fn a_body_which_holds_both_buffers_holds_the_next_response_until_it_is_rea
     let the_second_one = answers.pop().unwrap();
     let mut the_first_one = the_body_of_the_answer(answers.pop().unwrap()).await;
 
-    // Nobody reads the first body: the second response is not read
-    let mut the_second_one = std::pin::pin!(the_second_one.get_result());
+    // Nobody reads the first body, and the second response is here all the same
+    let mut the_second_one = the_body_of_the_answer(the_second_one).await;
 
+    // Its body is not: both buffers are held by the first one
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), the_second_one.as_mut())
+        tokio::time::timeout(Duration::from_millis(200), the_second_one.next_item())
             .await
             .is_err()
     );
@@ -1699,34 +1666,17 @@ async fn a_body_which_holds_both_buffers_holds_the_next_response_until_it_is_rea
     let mut the_first_body_is_in = Vec::new();
 
     while let Some(piece) = the_first_one.next_item().await.unwrap() {
-        let offset_in_its_buffer = match the_first_body_is_in.is_empty() {
-            true => the_first_head.len(),
-            false => 0,
-        };
-
-        the_first_body_is_in.push(piece.as_slice().as_ptr().wrapping_sub(offset_in_its_buffer));
-        the_first_body_as_it_has_come.extend_from_slice(piece.as_slice());
+        the_first_body_is_in.push(piece.as_ptr());
+        the_first_body_as_it_has_come.extend_from_slice(piece);
     }
 
     assert!(the_first_body_as_it_has_come == the_first_body);
     assert_eq!(the_first_body_is_in.len(), 2);
 
-    let super::HttpTask::Response(response) =
-        tokio::time::timeout(REQUEST_TIMEOUT, the_second_one.as_mut())
-            .await
-            .unwrap()
-            .unwrap()
-    else {
-        panic!("Unexpected web socket upgrade");
-    };
+    let ok = the_second_one.next_item().await.unwrap().unwrap();
 
-    let mut the_second_body = response.into_body();
-    let ok = the_second_body.next_item().await.unwrap().unwrap();
-
-    assert_eq!(ok.as_slice(), b"ok");
-
-    let the_second_body_is_in = ok.as_slice().as_ptr().wrapping_sub(THE_SECOND_HEAD.len());
-    assert!(the_first_body_is_in.contains(&the_second_body_is_in));
+    assert_eq!(ok, b"ok");
+    assert!(the_first_body_is_in.contains(&ok.as_ptr()));
 
     // The upstream is silent from now on
     read_loop.abort();

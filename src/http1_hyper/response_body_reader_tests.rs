@@ -98,7 +98,7 @@ async fn read_exactly(body: &mut BodyReader, size: usize) -> Vec<u8> {
 
     while result.len() < size {
         let piece = body.next_item().await.unwrap();
-        result.extend_from_slice(piece.expect("The body is over before its time").as_slice());
+        result.extend_from_slice(piece.expect("The body is over before its time"));
     }
 
     result
@@ -323,8 +323,6 @@ async fn a_body_nobody_reads_stays_with_the_upstream() {
     let mut received = 0;
 
     while let Some(piece) = body.next_item().await.unwrap() {
-        let piece = piece.as_slice();
-
         assert!(piece.iter().all(|byte| *byte == 7));
         received += piece.len();
     }
@@ -373,10 +371,9 @@ async fn a_reader_which_is_dropped_lets_the_connection_go() {
 }
 
 /// hyper takes the chunks of a chunked body apart before the body gets to the reader:
-/// what has come to it is the data, so the pieces are raw whatever the body was framed
-/// with on the wire
+/// what has come to it is the data, whatever the body was framed with on the wire
 #[tokio::test]
-async fn the_pieces_hyper_gives_are_raw() {
+async fn the_pieces_hyper_gives_are_the_data() {
     let responses: [(&'static [u8], &'static [u8]); 2] = [
         (
             b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nHello",
@@ -399,10 +396,7 @@ async fn the_pieces_hyper_gives_are_raw() {
         let mut data = Vec::new();
 
         while let Some(piece) = body.next_item().await.unwrap() {
-            assert!(matches!(piece, crate::BodyChunk::Raw(_)));
-            assert_eq!(piece.as_raw_slice(), piece.as_slice());
-
-            data.extend_from_slice(piece.as_slice());
+            data.extend_from_slice(piece);
         }
 
         assert_eq!(data, b"HelloWorld");
@@ -421,7 +415,7 @@ async fn a_body_reader_is_an_async_bytes_stream() {
     .await;
 
     let body: std::sync::Arc<
-        dyn rust_extensions::AsyncBytesStream<MyHttpClientError, Chunk = Bytes>
+        dyn rust_extensions::AsyncBytesStream<MyHttpClientError, Chunk = crate::BodyPiece>
             + Send
             + Sync
             + 'static,
@@ -432,7 +426,7 @@ async fn a_body_reader_is_an_async_bytes_stream() {
     let mut the_first_half = Vec::new();
 
     while the_first_half.len() < 5 {
-        the_first_half.extend(body.get_next().await.unwrap().unwrap());
+        the_first_half.extend_from_slice(&body.get_next().await.unwrap().unwrap());
     }
 
     assert_eq!(the_first_half, b"Hello");

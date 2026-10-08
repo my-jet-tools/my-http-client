@@ -109,7 +109,7 @@ async fn read_exactly(body: &mut BodyReader, size: usize) -> Vec<u8> {
 
     while result.len() < size {
         let piece = body.next_item().await.unwrap();
-        result.extend_from_slice(piece.expect("The body is over before its time").as_slice());
+        result.extend_from_slice(piece.expect("The body is over before its time"));
     }
 
     result
@@ -292,7 +292,7 @@ async fn a_body_reader_is_an_async_bytes_stream() {
     drop(frames);
 
     let body: Arc<
-        dyn rust_extensions::AsyncBytesStream<MyHttpClientError, Chunk = Bytes>
+        dyn rust_extensions::AsyncBytesStream<MyHttpClientError, Chunk = crate::BodyPiece>
             + Send
             + Sync
             + 'static,
@@ -307,8 +307,8 @@ async fn a_body_reader_is_an_async_bytes_stream() {
     let received = tokio::spawn(async move {
         let mut result = Vec::new();
 
-        while let Some(bytes) = body.get_next().await.unwrap() {
-            result.extend(bytes);
+        while let Some(piece) = body.get_next().await.unwrap() {
+            result.extend_from_slice(&piece);
         }
 
         result

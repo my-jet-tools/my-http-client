@@ -340,11 +340,11 @@ async fn chunked_body_still_works() {
     assert_eq!(response.into_body(), b"Hello World");
 }
 
-/// A chunked body is given the way it is on the wire, a chunk a piece: the size of the
-/// chunk, its data, its separator - with the data in one place of the piece. The chunk
-/// of no size which ends the body is the last piece, and the only one with no data
+/// A chunked body is given as its data, with what frames it cut off. The chunks which
+/// come in one read are one piece: their data is moved together, over what framed it, in
+/// the very buffer it is read into
 #[tokio::test]
-async fn chunked_body_is_cut_into_pieces_by_its_chunks() {
+async fn the_chunks_of_a_read_are_one_piece_of_data() {
     let (mut read_half, _held, mut buf) = setup(
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n",
         false,
@@ -365,19 +365,8 @@ async fn chunked_body_is_cut_into_pieces_by_its_chunks() {
         false,
     );
 
-    let expected: [(&[u8], &[u8]); 3] = [
-        (b"5\r\nHello\r\n", b"Hello"),
-        (b"6\r\n World\r\n", b" World"),
-        (b"0\r\n\r\n", b""),
-    ];
-
-    for (as_it_is_on_the_wire, data) in expected {
-        let piece = body.next_piece().await.unwrap().unwrap();
-
-        assert!(matches!(piece, crate::BodyChunk::Chunked(_)));
-        assert_eq!(piece.as_raw_slice(), as_it_is_on_the_wire);
-        assert_eq!(piece.as_slice(), data);
-    }
+    let piece = body.next_piece().await.unwrap().unwrap();
+    assert_eq!(piece.as_slice(), b"Hello World");
 
     assert!(body.next_piece().await.unwrap().is_none());
     assert!(body.is_completed());

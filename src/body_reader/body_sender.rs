@@ -1,9 +1,8 @@
+use rust_extensions::DoubleBufferChunk;
 use tokio::sync::mpsc;
 
-use super::BodyChunk;
-
 pub(super) enum BodyEvent {
-    Data(BodyChunk),
+    Data(DoubleBufferChunk),
     /// The body is sent to its end
     Completed,
     /// The body is over before its end, and this is why
@@ -23,16 +22,14 @@ impl BodySender {
         Self { sender }
     }
 
-    /// Sends the next piece of the body - a [`BodyChunk`], or just the bytes, which
-    /// make a raw one.
+    /// Sends the next piece of the body: the data of it which is read into a buffer of
+    /// a [`rust_extensions::DoubleBuffer`]. The buffer is free again once the reader is
+    /// done with the piece.
     ///
     /// Waits while [`super::RESPONSE_BODY_CHANNEL_CAPACITY`] pieces are waiting for the
     /// reader already. `false`: the reader is dropped, nobody needs the body any more
-    pub async fn send(&self, chunk: impl Into<BodyChunk>) -> bool {
-        self.sender
-            .send(BodyEvent::Data(chunk.into()))
-            .await
-            .is_ok()
+    pub async fn send(&self, piece: DoubleBufferChunk) -> bool {
+        self.sender.send(BodyEvent::Data(piece)).await.is_ok()
     }
 
     /// The body is sent to its end

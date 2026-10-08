@@ -6,18 +6,20 @@ use std::{
 use hyper::body::{Frame, SizeHint};
 use tokio::sync::{mpsc, Mutex};
 
-use super::{BodyChunk, BodyEvent, BodySender, RequestDeadline, RESPONSE_BODY_CHANNEL_CAPACITY};
+use super::{BodyEvent, BodyPiece, BodySender, RequestDeadline, RESPONSE_BODY_CHANNEL_CAPACITY};
 
 /// How the body of a response of the non-hyper client is read: it is received from the
 /// read loop of the client, which writes it to a [`BodySender`] as it comes off the
-/// socket. A chunked body comes the way it is on the wire - see
-/// [`BodyChunk::Chunked`].
+/// socket. A piece is the data one read has brought - for a chunked body the data of the
+/// chunks, with what framed them cut off.
 ///
-/// The pieces share the two buffers the socket is read into, and the socket is not read
-/// while both of them are held - nor while [`RESPONSE_BODY_CHANNEL_CAPACITY`] pieces wait
-/// to be received. That is the backpressure: a body nobody reads is held by the upstream
-/// and not by this process. A reader which keeps the pieces of both buffers and asks for
-/// the next one waits for ever: nothing is read until it lets go of a buffer.
+/// A piece is one of the two buffers the socket is read into, and the socket is not read
+/// while both of them are held. That is the backpressure: a body nobody reads is held by
+/// the upstream and not by this process. A reader which drops the piece it has before it
+/// asks for the one after the next is never held back; a reader which keeps the pieces
+/// of both buffers and asks for the next one waits for ever: nothing is read until it
+/// lets go of a buffer. [`super::BodyReader::next_item`] lets go of the piece it gave
+/// before on its own.
 /// **So the connection is busy with the body until it is read**, and the responses to
 /// the requests pipelined behind it wait for that. A reader which is dropped before the
 /// end of the body lets the connection go: what is left of the body is read past when
@@ -30,6 +32,8 @@ pub struct NoHyperBodyReaderInner {
     reading: Mutex<Reading>,
     content_length: Option<usize>,
     pub(crate) request_deadline: Option<RequestDeadline>,
+    /// The piece [`super::BodyReader::next_item`] has given last
+    pub(crate) current: Option<BodyPiece>,
 }
 
 struct Reading {
@@ -60,6 +64,7 @@ impl NoHyperBodyReaderInner {
             }),
             content_length,
             request_deadline: None,
+            current: None,
         };
 
         (BodySender::new(sender), result)
@@ -74,6 +79,7 @@ impl NoHyperBodyReaderInner {
             }),
             content_length: Some(0),
             request_deadline: None,
+            current: None,
         }
     }
 
@@ -97,13 +103,13 @@ impl NoHyperBodyReaderInner {
     pub(crate) fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<BodyChunk>, String>>> {
+    ) -> Poll<Option<Result<Frame<BodyPiece>, String>>> {
         self.reading.get_mut().poll_frame(cx)
     }
 
     /// The next frame for a reader which shares the body. The readers take turns: the
     /// one which is waiting for a frame holds the others back until it has got it
-    pub(crate) async fn next_frame(&self) -> Option<Result<Frame<BodyChunk>, String>> {
+    pub(crate) async fn next_frame(&self) -> Option<Result<Frame<BodyPiece>, String>> {
         let mut reading = self.reading.lock().await;
         poll_fn(|cx| reading.poll_frame(cx)).await
     }
@@ -126,7 +132,7 @@ impl Reading {
     fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<BodyChunk>, String>>> {
+    ) -> Poll<Option<Result<Frame<BodyPiece>, String>>> {
         let receiver = match &mut self.state {
             State::Receiving(receiver) => receiver,
             State::Over => return Poll::Ready(None),
@@ -134,9 +140,9 @@ impl Reading {
         };
 
         let result = match ready!(receiver.poll_recv(cx)) {
-            Some(BodyEvent::Data(chunk)) => {
-                self.received += chunk.as_slice().len();
-                Some(Ok(Frame::data(chunk)))
+            Some(BodyEvent::Data(piece)) => {
+                self.received += piece.len();
+                Some(Ok(Frame::data(BodyPiece::read(piece))))
             }
             Some(BodyEvent::Completed) => {
                 self.state = State::Over;

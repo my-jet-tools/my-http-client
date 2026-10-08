@@ -246,11 +246,12 @@ async fn send_response<
 /// Sends the body to its reader. `true`: the body is sent to its end; `false`: the
 /// reader is dropped, nobody needs the rest of it.
 ///
-/// The pieces are not copied out of the read buffer: they share its two buffers. While
-/// the reader is busy with the pieces of one buffer the socket is read into the other,
-/// and when that one is read as well the socket is not read until the reader is done
-/// with the first. So the body is not piled up here, however much the upstream has to
-/// give: what is in memory is the two buffers - see [`super::TcpBuffer`].
+/// A piece is not copied out of the buffer it is read into: it is a part of one of the
+/// two buffers of the body. While the reader is busy with one piece the socket is read
+/// into the other buffer, and when that one is read as well the socket is not read until
+/// the reader is done with the first. So the body is not piled up here, however much the
+/// upstream has to give: what is in memory is the two buffers - see
+/// [`super::TcpBuffer`].
 ///
 /// The reader may be dropped while nothing comes from the upstream - an event stream
 /// which is silent - so the reader is watched while the socket is read: the requests
@@ -265,18 +266,14 @@ async fn send_body<TStream: tokio::io::AsyncRead>(
     sender: BodySender,
 ) -> Result<bool, HttpParseError> {
     loop {
-        let piece = match body.take_piece() {
-            Err(HttpParseError::GetMoreData) => {
-                let read_more = std::pin::pin!(body.read_more());
-                let reader_is_dropped = std::pin::pin!(sender.reader_is_dropped());
+        let piece = {
+            let next_piece = std::pin::pin!(body.next_piece());
+            let reader_is_dropped = std::pin::pin!(sender.reader_is_dropped());
 
-                match futures::future::select(read_more, reader_is_dropped).await {
-                    Either::Left((Ok(()), _)) => continue,
-                    Either::Left((Err(err), _)) => Err(err),
-                    Either::Right(_) => return Ok(false),
-                }
+            match futures::future::select(next_piece, reader_is_dropped).await {
+                Either::Left((piece, _)) => piece,
+                Either::Right(_) => return Ok(false),
             }
-            piece => piece,
         };
 
         match piece {
