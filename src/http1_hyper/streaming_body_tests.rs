@@ -14,7 +14,7 @@ use crate::{MyHttpClientConnector, MyHttpClientError, PublishPayloadError, Reque
 use super::{HyperHttpResponse, MyHttpHyperClient};
 
 pub struct TestConnector {
-    host_port: String,
+    pub host_port: String,
 }
 
 #[async_trait::async_trait]

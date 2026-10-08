@@ -9,3 +9,6 @@ mod streamed_request;
 pub use streamed_request::*;
 #[cfg(test)]
 mod streaming_body_tests;
+
+#[cfg(test)]
+mod response_body_reader_tests;

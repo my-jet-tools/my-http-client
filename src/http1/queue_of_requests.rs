@@ -2,12 +2,12 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use http::Method;
-use http_body_util::combinators::BoxBody;
+use http_body_util::{combinators::BoxBody, BodyExt};
 use parking_lot::Mutex;
 use rust_extensions::{TaskCompletion, TaskCompletionAwaiter};
 use tokio::io::ReadHalf;
 
-use crate::MyHttpClientError;
+use crate::{BodyReader, MyHttpClientError};
 
 pub type HttpAwaitingTask<TStream> = TaskCompletion<HttpTask<TStream>, MyHttpClientError>;
 
@@ -22,7 +22,7 @@ pub type WebsocketUpgradeParts<TStream> = (
 );
 
 pub enum HttpTask<TStream: tokio::io::AsyncRead + Send + Sync + 'static> {
-    Response(hyper::Response<BoxBody<Bytes, String>>),
+    Response(hyper::Response<BodyReader>),
     WebsocketUpgrade {
         response: hyper::Response<BoxBody<Bytes, String>>,
         read_part: ReadHalf<TStream>,
@@ -37,7 +37,7 @@ pub enum HttpTask<TStream: tokio::io::AsyncRead + Send + Sync + 'static> {
 impl<TStream: tokio::io::AsyncRead + Send + Sync + 'static> HttpTask<TStream> {
     pub fn unwrap_response(self) -> hyper::Response<BoxBody<Bytes, String>> {
         match self {
-            HttpTask::Response(response) => response,
+            HttpTask::Response(response) => response.map(|body| body.boxed()),
             HttpTask::WebsocketUpgrade { response, .. } => response,
         }
     }

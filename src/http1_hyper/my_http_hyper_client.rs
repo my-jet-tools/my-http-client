@@ -6,10 +6,12 @@ use std::{
 
 use bytes::Bytes;
 use http::StatusCode;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full};
 use rust_extensions::date_time::DateTimeAsMicroseconds;
 
-use crate::{MyHttpClientConnector, MyHttpClientDisconnect, MyHttpClientError, RequestBodyStream};
+use crate::{
+    BodyReader, MyHttpClientConnector, MyHttpClientDisconnect, MyHttpClientError, RequestBodyStream,
+};
 
 use super::*;
 use crate::hyper::*;
@@ -81,7 +83,7 @@ impl<
     async fn get_response<TBody>(
         &self,
         req: hyper::Request<TBody>,
-        response: hyper::Response<BoxBody<Bytes, String>>,
+        response: hyper::Response<BodyReader>,
     ) -> Result<HyperHttpResponse, MyHttpClientError> {
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             #[cfg(feature = "with-websocket")]

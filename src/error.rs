@@ -7,6 +7,11 @@ pub enum MyHttpClientError {
     Disconnected,
     Disposed,
     RequestTimeout(Duration),
+    /// A response body is bigger than the limit it was asked to be read into memory
+    /// with - see [`crate::BodyReader::into_vec`]. `limit` is that limit in bytes
+    ResponseBodyTooLarge {
+        limit: usize,
+    },
     CanNotExecuteRequest(String),
     InvalidHttpHandshake(String),
     #[cfg(feature = "with-websocket")]

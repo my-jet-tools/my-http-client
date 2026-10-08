@@ -5,10 +5,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full};
 use rust_extensions::date_time::DateTimeAsMicroseconds;
 
-use crate::{MyHttpClientConnector, MyHttpClientError};
+use crate::{BodyReader, MyHttpClientConnector, MyHttpClientError};
 
 use super::{MyHttp2ClientInner, MyHttp2ConnectionState};
 use crate::hyper::*;
@@ -95,7 +95,7 @@ impl<
         &self,
         req: &hyper::Request<Full<Bytes>>,
         request_timeout: Duration,
-    ) -> Result<hyper::Response<BoxBody<Bytes, String>>, MyHttpClientError> {
+    ) -> Result<hyper::Response<BodyReader>, MyHttpClientError> {
         let request_is_idempotent = req.method().is_idempotent();
         let mut retry_no = 0;
         loop {
@@ -196,7 +196,7 @@ impl<
         req: hyper::Request<TBody>,
         content_size: Option<usize>,
         request_timeout: Duration,
-    ) -> Result<hyper::Response<BoxBody<Bytes, String>>, MyHttpClientError>
+    ) -> Result<hyper::Response<BodyReader>, MyHttpClientError>
     where
         TBody: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
         TBody::Error: std::fmt::Display,

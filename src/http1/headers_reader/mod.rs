@@ -13,7 +13,7 @@ pub async fn read_headers<TStream: tokio::io::AsyncRead>(
     read_timeout: Duration,
     print_input_http_stream: bool,
     request_method: Option<http::Method>,
-) -> Result<BodyReader, HttpParseError> {
+) -> Result<ResponseHead, HttpParseError> {
     let (status_code, version) = super::read_with_timeout::read_until_crlf(
         read_stream,
         tcp_buffer,
@@ -71,7 +71,7 @@ pub async fn read_headers<TStream: tokio::io::AsyncRead>(
 
     match detected_body_size {
         #[cfg(feature = "with-websocket")]
-        DetectedBodySize::WebSocketUpgrade => Ok(BodyReader::WebSocketUpgrade(
+        DetectedBodySize::WebSocketUpgrade => Ok(ResponseHead::WebSocketUpgrade(
             WebSocketUpgradeBuilder::new(builder),
         )),
         // A 101 which is not handed over as a websocket: an upgrade to another
@@ -80,27 +80,24 @@ pub async fn read_headers<TStream: tokio::io::AsyncRead>(
         // hang the read loop until the read timeout waiting for a >= 200 answer
         // that the switched connection will never send.
         _ if status_code == http::StatusCode::SWITCHING_PROTOCOLS => {
-            Ok(BodyReader::SwitchedProtocols { builder })
+            Ok(ResponseHead::SwitchedProtocols { builder })
         }
         // A non-101 1xx is an interim response, not the final one. It must
         // be skipped without completing the request (RFC 9110 §15.2); the read
         // loop keeps reading for the real >= 200 response. Checked before the
         // bodyless arm below so a 1xx is *skipped* rather than *delivered empty*.
-        _ if status_code.is_informational() => Ok(BodyReader::Interim),
+        _ if status_code.is_informational() => Ok(ResponseHead::Interim),
         // HEAD / 204 / 304 / a 2xx to CONNECT never carry a body, regardless of
         // any Content-Length or Transfer-Encoding header.
-        _ if !body_expected => Ok(BodyReader::LengthBased {
+        _ if !body_expected => Ok(ResponseHead::LengthBased {
             builder,
             body_size: 0,
         }),
-        DetectedBodySize::Chunked => {
-            let (sender, response) = create_chunked_body_response(builder)?;
-            Ok(BodyReader::Chunked { response, sender })
-        }
-        DetectedBodySize::Known(body_size) => Ok(BodyReader::LengthBased { builder, body_size }),
+        DetectedBodySize::Chunked => Ok(ResponseHead::Chunked { builder }),
+        DetectedBodySize::Known(body_size) => Ok(ResponseHead::LengthBased { builder, body_size }),
         // No length signal on a response that is allowed to have a body: the
         // body is delimited by connection close (read until EOF).
-        DetectedBodySize::Unknown => Ok(BodyReader::UntilClose { builder }),
+        DetectedBodySize::Unknown => Ok(ResponseHead::UntilClose { builder }),
     }
 }
 

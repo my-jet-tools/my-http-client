@@ -1,8 +1,15 @@
 use std::{sync::Arc, time::Duration};
 
+use futures::future::Either;
+
+use crate::{BodyReader, BodySender};
+
 use super::{HttpParseError, TcpBuffer};
 
-use super::{BodyReader, HttpTask, MyHttpClientInner};
+use super::{
+    BodyFraming, ChunksReadingMode, HttpTask, MyHttpClientInner, ResponseBodyOnTheWire,
+    ResponseHead,
+};
 use tokio::io::ReadHalf;
 
 pub async fn read_loop<
@@ -52,8 +59,8 @@ pub async fn read_loop<
         )
         .await
         {
-            Ok(body_reader) => match body_reader {
-                BodyReader::Interim => {
+            Ok(response_head) => match response_head {
+                ResponseHead::Interim => {
                     // A non-final 1xx response (e.g. 100 Continue / 103 Early
                     // Hints). Discard it WITHOUT popping the request and keep
                     // reading for the real final response, which still belongs
@@ -68,82 +75,73 @@ pub async fn read_loop<
                     }
                     continue;
                 }
-                BodyReader::LengthBased { builder, body_size } => {
+                ResponseHead::LengthBased { builder, body_size } => {
                     interim_count = 0;
-                    let response = super::body_reader::read_full_body(
-                        &mut read_stream,
-                        &mut tcp_buffer,
-                        builder,
-                        body_size,
-                        read_timeout,
-                    )
-                    .await?;
 
-                    let request = inner.pop_request(connection_id, false);
-                    if let Some(mut request) = request {
-                        let result = request.try_set_ok(HttpTask::Response(response));
+                    let connection_goes_on = if body_size == 0 {
+                        let response = builder.body(BodyReader::empty())?;
+                        deliver_response(&inner, connection_id, response)
+                    } else {
+                        let body = ResponseBodyOnTheWire::new(
+                            &mut read_stream,
+                            &mut tcp_buffer,
+                            BodyFraming::LengthBased(body_size),
+                            read_timeout,
+                            print_input_http_stream,
+                        );
 
-                        if result.is_err() {
-                            return Ok(());
-                        }
+                        send_response(&inner, connection_id, builder, body).await?
+                    };
+
+                    if !connection_goes_on {
+                        return Ok(());
                     }
                 }
-                BodyReader::UntilClose { builder } => {
-                    // Close-delimited body: read to EOF, hand back the response,
-                    // then stop. The stream is consumed by the close, so this
-                    // connection must not be reused for keep-alive. Returning
-                    // Ok(()) lets `read_loop_stopped` transition it to
-                    // Disconnected so the next send reconnects.
-                    let response = super::body_reader::read_until_close(
+                ResponseHead::UntilClose { builder } => {
+                    // Close-delimited body: it is sent to its reader until EOF, then
+                    // the loop stops. The stream is consumed by the close, so this
+                    // connection must not be reused for keep-alive. Returning Ok(())
+                    // lets `read_loop_stopped` transition it to Disconnected so the
+                    // next send reconnects.
+                    let body = ResponseBodyOnTheWire::new(
                         &mut read_stream,
                         &mut tcp_buffer,
-                        builder,
+                        BodyFraming::UntilClose,
                         read_timeout,
-                    )
-                    .await?;
+                        print_input_http_stream,
+                    );
 
-                    let request = inner.pop_request(connection_id, false);
-                    if let Some(mut request) = request {
-                        let _ = request.try_set_ok(HttpTask::Response(response));
-                    }
+                    send_response(&inner, connection_id, builder, body).await?;
 
                     return Ok(());
                 }
-                BodyReader::Chunked { response, sender } => {
+                ResponseHead::Chunked { builder } => {
                     interim_count = 0;
-                    let request = inner.pop_request(connection_id, false);
-                    if let Some(mut request) = request {
-                        let result = request.try_set_ok(HttpTask::Response(response));
 
-                        if result.is_err() {
-                            return Ok(());
-                        }
-                    }
-
-                    super::body_reader::read_chunked_body(
+                    let body = ResponseBodyOnTheWire::new(
                         &mut read_stream,
                         &mut tcp_buffer,
-                        sender,
+                        BodyFraming::Chunked(ChunksReadingMode::WaitingFroChunkSize),
                         read_timeout,
                         print_input_http_stream,
-                    )
-                    .await?;
+                    );
+
+                    if !send_response(&inner, connection_id, builder, body).await? {
+                        return Ok(());
+                    }
                 }
-                BodyReader::SwitchedProtocols { builder } => {
+                ResponseHead::SwitchedProtocols { builder } => {
                     // The protocol is switched away from HTTP: the head is the
                     // final answer, and the connection can not serve HTTP any
                     // more. Returning Ok(()) lets `read_loop_stopped` move it to
                     // Disconnected so the next send dials a new one.
-                    let response = crate::utils::into_empty_body(builder)?;
-                    let request = inner.pop_request(connection_id, false);
-                    if let Some(mut request) = request {
-                        let _ = request.try_set_ok(HttpTask::Response(response));
-                    }
+                    let response = builder.body(BodyReader::empty())?;
+                    deliver_response(&inner, connection_id, response);
 
                     return Ok(());
                 }
                 #[cfg(feature = "with-websocket")]
-                BodyReader::WebSocketUpgrade(mut builder) => {
+                ResponseHead::WebSocketUpgrade(mut builder) => {
                     let upgrade_response = builder.take_upgrade_response()?;
 
                     // The server normally writes its first websocket frame right
@@ -178,4 +176,133 @@ pub async fn read_loop<
     }
 
     Ok(())
+}
+
+/// Hands the response over to the request it answers. `false`: there is nobody to hand
+/// it to - no request is waiting for an answer, or its caller has given up. A response
+/// nobody has asked for leaves nothing to do with the connection but to close it.
+///
+/// The response is dropped then, and the reader of its body with it. It must not stay
+/// here: a body which is sent to a reader held by the sending side waits for a reader
+/// which is never going to read
+fn deliver_response<
+    TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'static,
+>(
+    inner: &MyHttpClientInner<TStream>,
+    connection_id: u64,
+    response: http::Response<BodyReader>,
+) -> bool {
+    let Some(mut request) = inner.pop_request(connection_id, false) else {
+        return false;
+    };
+
+    request.try_set_ok(HttpTask::Response(response)).is_ok()
+}
+
+/// Hands the response over on its head, and sends its body after it to the reader the
+/// response carries - piece by piece, as it comes off the socket.
+///
+/// `false` is a connection which can not go on with the next response: nobody waits
+/// for this one, or its body is abandoned by the reader with more of it left on the
+/// wire than is worth reading past - see [`super::MAX_ABANDONED_BODY_SIZE`] and
+/// [`super::ABANDONED_BODY_SKIP_TIMEOUT`].
+///
+/// Fails when the builder carries an error - a head of the response it did not take -
+/// and when the body can not be read to its end
+async fn send_response<
+    TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'static,
+>(
+    inner: &MyHttpClientInner<TStream>,
+    connection_id: u64,
+    builder: http::response::Builder,
+    mut body: ResponseBodyOnTheWire<'_, TStream>,
+) -> Result<bool, HttpParseError> {
+    let (sender, body_reader) = BodyReader::new(body.remains_to_read());
+    let response = builder.body(body_reader)?;
+
+    if !deliver_response(inner, connection_id, response) {
+        return Ok(false);
+    }
+
+    if send_body(&mut body, sender).await? {
+        return Ok(true);
+    }
+
+    // The reader is dropped before the end of the body. A client which is disposed
+    // meanwhile has no use for the connection
+    if !inner.is_my_connection_id(connection_id) {
+        return Ok(false);
+    }
+
+    let skipped = tokio::time::timeout(
+        super::ABANDONED_BODY_SKIP_TIMEOUT,
+        body.skip_the_rest(super::MAX_ABANDONED_BODY_SIZE),
+    )
+    .await;
+
+    Ok(matches!(skipped, Ok(true)))
+}
+
+/// Sends the body to its reader. `true`: the body is sent to its end; `false`: the
+/// reader is dropped, nobody needs the rest of it.
+///
+/// The reader may be dropped while nothing comes from the upstream - an event stream
+/// which is silent - so the reader is watched while the socket is read: the requests
+/// behind this body must not wait for a piece of it nobody is going to take.
+///
+/// The head of the response is with its caller by the time the body is read, so a
+/// failure can not fail the request any more. It is sent down the body instead, as its
+/// last item - otherwise the body would just end, and what was read before the failure
+/// would look like the whole of it
+async fn send_body<TStream: tokio::io::AsyncRead>(
+    body: &mut ResponseBodyOnTheWire<'_, TStream>,
+    sender: BodySender,
+) -> Result<bool, HttpParseError> {
+    loop {
+        let piece = {
+            let next_piece = std::pin::pin!(body.next_piece());
+            let reader_is_dropped = std::pin::pin!(sender.reader_is_dropped());
+
+            match futures::future::select(next_piece, reader_is_dropped).await {
+                Either::Left((piece, _)) => piece,
+                Either::Right(_) => return Ok(false),
+            }
+        };
+
+        match piece {
+            Ok(Some(piece)) => {
+                if !sender.send(piece).await {
+                    return Ok(false);
+                }
+            }
+            Ok(None) => {
+                sender.complete().await;
+                return Ok(true);
+            }
+            Err(err) => {
+                sender.fail(why_the_body_is_not_complete(&err)).await;
+
+                // An invalid payload is reported to the request which is next in the
+                // queue, and this one is not about it: its response has not begun
+                return Err(match err {
+                    HttpParseError::InvalidHttpPayload(reason) => HttpParseError::Error(reason),
+                    err => err,
+                });
+            }
+        }
+    }
+}
+
+fn why_the_body_is_not_complete(err: &HttpParseError) -> String {
+    let reason = match err {
+        HttpParseError::InvalidHttpPayload(reason) => reason.as_str().to_string(),
+        HttpParseError::Error(reason) => reason.as_str().to_string(),
+        HttpParseError::Disconnected => "the connection is closed".to_string(),
+        HttpParseError::ReadingTimeout(timeout) => {
+            format!("no data from the upstream for {:?}", timeout)
+        }
+        HttpParseError::GetMoreData => "the rest of it has not arrived".to_string(),
+    };
+
+    format!("The response body is not complete: {}", reason)
 }

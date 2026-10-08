@@ -1,12 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
-use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
 use hyper::client::conn::http1::SendRequest;
 use rust_extensions::date_time::DateTimeAsMicroseconds;
 use tokio::sync::Mutex;
 
-use crate::{hyper::*, HyperRequest, HyperRequestBody, MyHttpClientError};
+use crate::{hyper::*, BodyReader, HyperRequest, HyperRequestBody, MyHttpClientError};
 
 pub enum MyHttpHyperConnectionState {
     Disconnected,
@@ -49,12 +47,17 @@ impl MyHttpHyperClientInner {
 
     /// The body is already erased to [`crate::HyperRequestBody`] here: one connection
     /// serves both the buffered and the streamed requests, so a single body type has to
-    /// travel through `SendRequest`
+    /// travel through `SendRequest`.
+    ///
+    /// The response comes back on its head: its body is read through the
+    /// [`BodyReader`] it carries
     pub async fn send_payload(
         &self,
         req: HyperRequest,
         request_timeout: Duration,
-    ) -> Result<hyper::Response<BoxBody<Bytes, String>>, SendHyperPayloadError> {
+    ) -> Result<hyper::Response<BodyReader>, SendHyperPayloadError> {
+        let deadline = tokio::time::Instant::now().checked_add(request_timeout);
+
         let (send_request_feature, connected, current_connection_id) = {
             let mut state = self.state.lock().await;
             match &mut *state {
@@ -89,7 +92,11 @@ impl MyHttpHyperClientInner {
         };
 
         match result {
-            Ok(response) => Ok(crate::utils::from_incoming_body(response)),
+            Ok(response) => Ok(crate::from_hyper_response(
+                response,
+                deadline,
+                request_timeout,
+            )),
             Err(err) => {
                 self.disconnect(current_connection_id).await;
                 Err(SendHyperPayloadError::HyperError { connected, err })

@@ -14,7 +14,8 @@ and over the connector which produces it:
 | `http2`        | HTTP/2 on top of `hyper::client::conn::http2`                                 |
 
 This document covers the request bodies - the buffered and the streamed one. All three clients can
-stream a request body through `do_streamed_request`.
+stream a request body through `do_streamed_request`, and all three hand a response body over the
+same way - see [Reading a response body: `BodyReader`](#reading-a-response-body-bodyreader).
 
 ## Features
 
@@ -252,6 +253,113 @@ HTTP/2 has no chunked encoding either, so `content_size` means a little less her
 announces a `content-length` (hyper then refuses a body which does not deliver exactly that many
 bytes), `None` sends the body with no length announced at all. Both are streamed the same way.
 
+## Reading a response body: `BodyReader`
+
+Every client returns as soon as the **head** of the response is read. The body is not read by then:
+the response is an `http::Response<BodyReader>`, and the body is read through that reader.
+
+| client | what it returns |
+| --- | --- |
+| `http1::MyHttpClient` | `MyHttpResponse::Response(http::Response<BodyReader>)` |
+| `http1_hyper::MyHttpHyperClient` | `HyperHttpResponse::Response(http::Response<BodyReader>)` |
+| `http2::MyHttp2Client` | `http::Response<BodyReader>` |
+
+```rust
+let (head, mut body) = response.into_parts();
+
+// piece by piece, as it comes over the network - `None` is the end of the body
+while let Some(piece) = body.get_next().await? {
+    // bytes::Bytes
+}
+
+// or the whole of it - what is left of it, when a part is taken by get_next already.
+// The limit is the caller's: a bigger body fails with ResponseBodyTooLarge
+let body: Vec<u8> = body.into_vec(10 * 1024 * 1024).await?;
+```
+
+| | `get_next()` | `into_vec(max_size)` |
+| --- | --- | --- |
+| gives | the next piece, as it came off the socket | the whole body |
+| held in memory | the pieces waiting to be taken | the body, up to `max_size` - a bigger one is refused |
+| bounded in time by | nothing but the silence of the upstream (see below) | the `request_timeout` the request was sent with |
+
+`max_size` is the only limit there is, and it is the caller's: the clients do not hold a body, so
+they have no limit of their own. A body which says it is bigger than `max_size` fails with
+`MyHttpClientError::ResponseBodyTooLarge { limit }` before a byte of it is read; a body which does
+not say fails with it as soon as it grows past the limit. `usize::MAX` takes a body of any size.
+
+`request_timeout` covers the request, the head and `into_vec`: a request whose body is read into
+memory is bounded as a whole. A body read piece by piece may last for as long as the upstream keeps
+sending it - an event stream does.
+
+`content_length()` is the size of the body when the response says it, `remains_to_read()` is what
+is left of it; both are `None` for a body which does not say - chunked, or lasting until the
+connection is closed.
+
+A body which is cut short - the connection is closed, the framing is broken - ends with an error
+(`The response body is not complete: ...`) and keeps answering with it, so a part of a body never
+passes for a whole one. The request is not sent again: its head is with the caller already, and
+replaying it is the caller's decision.
+
+`BodyReader` is a `hyper::body::Body` as well, so it can be handed to hyper as it is, or boxed into
+a `HyperResponse` - `MyHttpResponse::into_response()` does that. It reports the exact size of what
+is left when the response has a `content-length`, and carries the trailers of an HTTP/2 response,
+which `get_next` and `into_vec` read past.
+
+### `Hyper` / `NoHyper`: what reads the connection
+
+`BodyReader` is an enum of two cases. What reads the connection differs between the clients, and
+each case keeps the whole of its reading in its inner:
+
+| case | clients | how the body gets there |
+| --- | --- | --- |
+| `NoHyper(NoHyperBodyReaderInner)` | `http1` | the read loop of the client writes it to a `BodySender`, and the reader receives it through a channel with backpressure |
+| `Hyper(HyperBodyReaderInner)` | `http1_hyper`, `http2` | a wrapper of the body hyper gives (`Incoming`), taken frame by frame with nothing in between |
+
+Whatever the case is, **a body which is not read is not held in memory** - it stays with the
+upstream.
+
+### `NoHyper`: the read loop writes the body
+
+The read loop is the only reader of the socket. Having read the head it hands the response over and
+goes on with the body, writing it to the `BodySender` whatever the framing is:
+
+| framing | what is sent |
+| --- | --- |
+| `content-length` | what a read() of the socket has brought, until that many bytes are sent |
+| `transfer-encoding: chunked` | the same, with the sizes of the chunks and their separators taken out |
+| neither of them | what a read() has brought, until the upstream closes the connection |
+
+A piece is `MAX_RESPONSE_BODY_PIECE_SIZE` (64 KB) at most, and a chunk does not have to be complete
+to be sent. Each read is bounded by `set_read_from_stream_timeout`: a body which is silent for that
+long ends with an error. The read loop ends the body explicitly; a sender which is just dropped
+leaves a body which is not complete, so a read loop which is gone can not pass for the end of a
+body.
+
+The channel is what gives the backpressure. Once `RESPONSE_BODY_CHANNEL_CAPACITY` (16) pieces wait
+for the reader, the socket is not read any more, so a body nobody is in a hurry to read stays with
+the upstream - however big it is. This client pipelines, so that has a price: **the connection is
+busy with a body until it is read**, and the responses to the requests issued meanwhile wait for
+that. A body which fits into the 16 pieces is off the wire at once and holds nothing.
+
+Dropping the reader before the end of the body lets the connection go. What is left of the body is
+read past - up to `MAX_ABANDONED_BODY_SIZE` (1 MB), for `ABANDONED_BODY_SKIP_TIMEOUT` (1 second) -
+and the connection goes on with the next response. With more than that left - a big download, an
+event stream - the connection is closed instead. The requests behind that body get `Disconnected`,
+which `do_request` answers by sending them again through a new connection - the way it does after
+any other disconnect.
+
+The client has to outlive the body: dropping the client shuts the connection down.
+
+### `Hyper`: a wrapper of hyper's body
+
+It is hyper which holds the body back while it is not read, the way the protocol does it. An
+HTTP/1.1 connection is busy with a body until it is read or dropped. An HTTP/2 stream has a window
+of its own, so a body which is not read holds nothing but its own stream.
+
+Dropping the reader drops hyper's body with it: an HTTP/1.1 connection is given up, an HTTP/2
+stream is reset. `BodyReader::from_hyper(incoming)` wraps a body which comes from hyper elsewhere.
+
 ## Web socket upgrade
 
 Requires the `with-websocket` feature.
@@ -260,7 +368,7 @@ All three ways of sending a request through `http1_hyper` end up with a `HyperHt
 
 ```rust
 pub enum HyperHttpResponse {
-    Response(HyperResponse),
+    Response(http::Response<BodyReader>),
     #[cfg(feature = "with-websocket")]
     WebSocketUpgrade { response: HyperResponse, web_socket: HyperWebsocket },
 }

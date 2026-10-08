@@ -22,12 +22,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// What the upstream does with the socket once the answer is written
 #[derive(Clone, Copy)]
-enum Then {
+pub enum Then {
     KeepOpen,
     Close,
 }
 
-async fn read_request_heads(socket: &mut TcpStream, amount: usize) {
+pub async fn read_request_heads(socket: &mut TcpStream, amount: usize) {
     let mut received = Vec::new();
     let mut buffer = [0u8; 4096];
 
@@ -47,7 +47,7 @@ async fn read_request_heads(socket: &mut TcpStream, amount: usize) {
 
 /// An upstream of a single connection: reads a request and answers with `response`,
 /// byte for byte
-async fn client_of_an_upstream_answering(
+pub async fn client_of_an_upstream_answering(
     response: &'static [u8],
     then: Then,
 ) -> MyHttpClient<TcpStream, TestConnector> {
@@ -69,7 +69,7 @@ async fn client_of_an_upstream_answering(
     })
 }
 
-fn get_request() -> MyHttpRequest {
+pub fn get_request() -> MyHttpRequest {
     let mut headers = MyHttpClientHeadersBuilder::new();
     headers.add_header("host", "localhost").unwrap();
     MyHttpRequest::new(Method::GET, "/", Version::HTTP_11, &headers, vec![]).unwrap()
@@ -226,7 +226,7 @@ async fn a_chunk_size_which_is_not_utf8_ends_the_body_with_an_error() {
     assert_eq!(data, b"Hello".to_vec());
     assert_eq!(
         error.as_deref(),
-        Some("The chunked body is not complete: Invalid chunk size: \"\u{fffd}\u{fffd}\"")
+        Some("The response body is not complete: Invalid chunk size: \"\u{fffd}\u{fffd}\"")
     );
 }
 
@@ -241,7 +241,7 @@ async fn a_chunk_size_which_is_not_a_number_ends_the_body_with_an_error() {
     assert_eq!(data, b"Hello".to_vec());
     assert_eq!(
         error.as_deref(),
-        Some("The chunked body is not complete: Invalid chunk size: \"xyz\"")
+        Some("The response body is not complete: Invalid chunk size: \"xyz\"")
     );
 }
 
@@ -258,7 +258,7 @@ async fn a_connection_lost_in_the_middle_of_a_chunked_body_ends_it_with_an_error
     assert_eq!(data, b"Hello".to_vec());
     assert_eq!(
         error.as_deref(),
-        Some("The chunked body is not complete: the connection is closed")
+        Some("The response body is not complete: the connection is closed")
     );
 }
 
@@ -327,73 +327,17 @@ fn builder_which_carries_an_error() -> http::response::Builder {
     http::Response::builder().header("bad name", "value")
 }
 
-fn assert_is_an_invalid_response_head<T>(result: Result<T, super::HttpParseError>) {
-    match result {
-        Ok(_) => panic!("The response has been put together"),
-        Err(err) => assert_eq!(
-            err.as_invalid_payload(),
-            Some("Invalid HTTP response head: invalid HTTP header name"),
-        ),
-    }
-}
-
 /// The functions which put a response together take the builder from whoever calls
 /// them. The read loop never hands them one which carries an error, but they are public
 #[tokio::test]
 async fn a_response_builder_which_carries_an_error_is_reported() {
     assert!(crate::utils::into_empty_body(builder_which_carries_an_error()).is_err());
     assert!(crate::utils::into_body(builder_which_carries_an_error(), b"ok".to_vec()).is_err());
-    assert!(super::create_chunked_body_response(builder_which_carries_an_error()).is_err());
-    assert!(super::FullBodyReaderInner {
-        builder: builder_which_carries_an_error(),
-        body: b"ok".to_vec(),
-    }
-    .into_body()
-    .is_err());
 
     #[cfg(feature = "with-websocket")]
     assert!(
         super::WebSocketUpgradeBuilder::new(builder_which_carries_an_error())
             .take_upgrade_response()
             .is_err()
-    );
-
-    let (client, mut upstream) = tokio::io::duplex(1024);
-    let (mut read_half, _write_half) = tokio::io::split(client);
-    upstream.write_all(b"okok").await.unwrap();
-    drop(upstream);
-
-    let mut buffer = super::TcpBuffer::new();
-
-    assert_is_an_invalid_response_head(
-        super::read_full_body(
-            &mut read_half,
-            &mut buffer,
-            builder_which_carries_an_error(),
-            0,
-            REQUEST_TIMEOUT,
-        )
-        .await,
-    );
-
-    assert_is_an_invalid_response_head(
-        super::read_full_body(
-            &mut read_half,
-            &mut buffer,
-            builder_which_carries_an_error(),
-            2,
-            REQUEST_TIMEOUT,
-        )
-        .await,
-    );
-
-    assert_is_an_invalid_response_head(
-        super::read_until_close(
-            &mut read_half,
-            &mut buffer,
-            builder_which_carries_an_error(),
-            REQUEST_TIMEOUT,
-        )
-        .await,
     );
 }

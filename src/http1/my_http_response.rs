@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
 use http::{HeaderMap, StatusCode};
+use http_body_util::BodyExt;
 
-use crate::MyHttpClientDisconnect;
+use crate::{BodyReader, MyHttpClientDisconnect};
 
 pub enum MyHttpResponse<
     TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'static,
 > {
-    Response(crate::HyperResponse),
+    /// The head of the response is read, its body is not: it follows through the
+    /// [`BodyReader`], and the connection is busy with it until it is read
+    Response(http::Response<BodyReader>),
     WebSocketUpgrade {
         stream: TStream,
         response: crate::HyperResponse,
@@ -44,9 +47,11 @@ impl<TStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'stat
         }
     }
 
+    /// The response as hyper's: the body reader is a `hyper::body::Body`, and the body
+    /// still comes frame by frame, as it is read off the socket
     pub fn into_response(self) -> crate::HyperResponse {
         match self {
-            MyHttpResponse::Response(response) => response,
+            MyHttpResponse::Response(response) => response.map(|body| body.boxed()),
             MyHttpResponse::WebSocketUpgrade { response, .. } => response,
         }
     }

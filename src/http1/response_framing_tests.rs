@@ -1,18 +1,17 @@
 //! Tests for HTTP/1 response-body framing (RFC 9112 §6.3): that the request
-//! method and response status are honoured when selecting the body reader.
+//! method and response status are honoured when selecting how the body is read.
 //!
 //! Each test drives [`read_headers`] over an in-memory duplex stream primed with
-//! a raw server response, asserts the selected [`BodyReader`] variant, then runs
-//! the matching body reader and checks the delivered body.
+//! a raw server response, asserts the selected [`ResponseHead`] variant, then reads
+//! the body with the matching framing and checks what is delivered.
 
 use std::time::Duration;
 
 use http::Method;
-use http_body_util::BodyExt;
 use tokio::io::{AsyncWriteExt, DuplexStream, ReadHalf};
 
 use super::{
-    read_chunked_body, read_full_body, read_headers, read_until_close, BodyReader, TcpBuffer,
+    read_headers, BodyFraming, ChunksReadingMode, ResponseBodyOnTheWire, ResponseHead, TcpBuffer,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,14 +46,22 @@ async fn setup(
     (read_half, held, buf)
 }
 
-async fn collect_body(response: crate::HyperResponse) -> Vec<u8> {
-    response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes()
-        .to_vec()
+/// The response with its body read the way the read loop reads it: piece by piece,
+/// out of what is in the buffer already and off the socket
+async fn response_of(
+    mut read_half: ReadHalf<DuplexStream>,
+    mut buf: TcpBuffer,
+    builder: http::response::Builder,
+    framing: BodyFraming,
+) -> http::Response<Vec<u8>> {
+    let mut body = ResponseBodyOnTheWire::new(&mut read_half, &mut buf, framing, TIMEOUT, false);
+    let mut data = Vec::new();
+
+    while let Some(piece) = body.next_piece().await.unwrap() {
+        data.extend_from_slice(&piece);
+    }
+
+    builder.body(data).unwrap()
 }
 
 /// Bug A: a HEAD response carries `Content-Length: N` but no body. The reader
@@ -66,21 +73,19 @@ async fn head_with_content_length_returns_empty_without_hang() {
     let (mut read_half, _held, mut buf) =
         setup(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n", false).await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::HEAD))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::HEAD))
         .await
         .unwrap();
 
-    let (builder, body_size) = match body_reader {
-        BodyReader::LengthBased { builder, body_size } => (builder, body_size),
+    let (builder, body_size) = match response_head {
+        ResponseHead::LengthBased { builder, body_size } => (builder, body_size),
         other => panic!("Expected LengthBased, got {:?}", other),
     };
     assert_eq!(body_size, 0);
 
-    let response = read_full_body(&mut read_half, &mut buf, builder, body_size, TIMEOUT)
-        .await
-        .unwrap();
+    let response = response_of(read_half, buf, builder, BodyFraming::LengthBased(body_size)).await;
     assert_eq!(response.status(), 200);
-    assert!(collect_body(response).await.is_empty());
+    assert!(response.into_body().is_empty());
 }
 
 /// A HEAD response with no length signal must still be treated as bodyless
@@ -89,12 +94,12 @@ async fn head_with_content_length_returns_empty_without_hang() {
 async fn head_without_length_is_empty_not_until_close() {
     let (mut read_half, _held, mut buf) = setup(b"HTTP/1.1 200 OK\r\n\r\n", false).await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::HEAD))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::HEAD))
         .await
         .unwrap();
 
-    match body_reader {
-        BodyReader::LengthBased { body_size, .. } => assert_eq!(body_size, 0),
+    match response_head {
+        ResponseHead::LengthBased { body_size, .. } => assert_eq!(body_size, 0),
         other => panic!("Expected LengthBased {{ body_size: 0 }}, got {:?}", other),
     }
 }
@@ -111,12 +116,12 @@ async fn head_with_chunked_encoding_returns_empty() {
     )
     .await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::HEAD))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::HEAD))
         .await
         .unwrap();
 
-    match body_reader {
-        BodyReader::LengthBased { body_size, .. } => assert_eq!(body_size, 0),
+    match response_head {
+        ResponseHead::LengthBased { body_size, .. } => assert_eq!(body_size, 0),
         other => panic!("Expected LengthBased {{ body_size: 0 }}, got {:?}", other),
     }
 }
@@ -131,27 +136,25 @@ async fn close_delimited_body_is_returned_in_full() {
     )
     .await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
-    let builder = match body_reader {
-        BodyReader::UntilClose { builder } => builder,
+    let builder = match response_head {
+        ResponseHead::UntilClose { builder } => builder,
         other => panic!("Expected UntilClose, got {:?}", other),
     };
 
-    let response = read_until_close(&mut read_half, &mut buf, builder, TIMEOUT)
-        .await
-        .unwrap();
+    let response = response_of(read_half, buf, builder, BodyFraming::UntilClose).await;
     assert_eq!(response.status(), 200);
-    assert_eq!(collect_body(response).await, b"Hello, close-delimited world!");
+    assert_eq!(response.into_body(), b"Hello, close-delimited world!");
 }
 
 /// Bug B, exercising the actual socket read-until-EOF loop: the header block is
 /// delivered and parsed first, then the body arrives over the socket in several
-/// separate writes before the connection closes. This proves `read_until_close`
-/// accumulates body bytes read from the stream (not just bytes pre-buffered by
-/// the header parser).
+/// separate writes before the connection closes. This proves the body is made of
+/// the bytes read from the stream (not just bytes pre-buffered by the header
+/// parser).
 #[tokio::test]
 async fn close_delimited_body_read_from_socket_across_multiple_writes() {
     let (client, mut server) = tokio::io::duplex(1024 * 1024);
@@ -168,12 +171,12 @@ async fn close_delimited_body_read_from_socket_across_multiple_writes() {
         .await
         .unwrap();
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
-    let builder = match body_reader {
-        BodyReader::UntilClose { builder } => builder,
+    let builder = match response_head {
+        ResponseHead::UntilClose { builder } => builder,
         other => panic!("Expected UntilClose, got {:?}", other),
     };
 
@@ -187,13 +190,11 @@ async fn close_delimited_body_read_from_socket_across_multiple_writes() {
         drop(server);
     });
 
-    let response = read_until_close(&mut read_half, &mut buf, builder, TIMEOUT)
-        .await
-        .unwrap();
-    writer.await.unwrap();
+    let response = response_of(read_half, buf, builder, BodyFraming::UntilClose).await;
 
     assert_eq!(response.status(), 200);
-    assert_eq!(collect_body(response).await, b"part-one;part-two;part-three");
+    assert_eq!(response.into_body(), b"part-one;part-two;part-three");
+    writer.await.unwrap();
 }
 
 /// An empty close-delimited body (headers, then immediate close) yields a
@@ -202,44 +203,43 @@ async fn close_delimited_body_read_from_socket_across_multiple_writes() {
 async fn close_delimited_empty_body() {
     let (mut read_half, _held, mut buf) = setup(b"HTTP/1.1 200 OK\r\n\r\n", true).await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
-    let builder = match body_reader {
-        BodyReader::UntilClose { builder } => builder,
+    let builder = match response_head {
+        ResponseHead::UntilClose { builder } => builder,
         other => panic!("Expected UntilClose, got {:?}", other),
     };
 
-    let response = read_until_close(&mut read_half, &mut buf, builder, TIMEOUT)
-        .await
-        .unwrap();
+    let response = response_of(read_half, buf, builder, BodyFraming::UntilClose).await;
     assert_eq!(response.status(), 200);
-    assert!(collect_body(response).await.is_empty());
+    assert!(response.into_body().is_empty());
 }
 
 /// 204 No Content that (incorrectly, but observed in the wild) carries a
 /// Content-Length must still return empty without hanging.
 #[tokio::test]
 async fn no_content_204_with_content_length_returns_empty() {
-    let (mut read_half, _held, mut buf) =
-        setup(b"HTTP/1.1 204 No Content\r\nContent-Length: 42\r\n\r\n", false).await;
+    let (mut read_half, _held, mut buf) = setup(
+        b"HTTP/1.1 204 No Content\r\nContent-Length: 42\r\n\r\n",
+        false,
+    )
+    .await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
-    let (builder, body_size) = match body_reader {
-        BodyReader::LengthBased { builder, body_size } => (builder, body_size),
+    let (builder, body_size) = match response_head {
+        ResponseHead::LengthBased { builder, body_size } => (builder, body_size),
         other => panic!("Expected LengthBased, got {:?}", other),
     };
     assert_eq!(body_size, 0);
 
-    let response = read_full_body(&mut read_half, &mut buf, builder, body_size, TIMEOUT)
-        .await
-        .unwrap();
+    let response = response_of(read_half, buf, builder, BodyFraming::LengthBased(body_size)).await;
     assert_eq!(response.status(), 204);
-    assert!(collect_body(response).await.is_empty());
+    assert!(response.into_body().is_empty());
 }
 
 /// 304 Not Modified commonly echoes the cached representation's Content-Length
@@ -252,21 +252,19 @@ async fn not_modified_304_with_content_length_returns_empty() {
     )
     .await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
-    let (builder, body_size) = match body_reader {
-        BodyReader::LengthBased { builder, body_size } => (builder, body_size),
+    let (builder, body_size) = match response_head {
+        ResponseHead::LengthBased { builder, body_size } => (builder, body_size),
         other => panic!("Expected LengthBased, got {:?}", other),
     };
     assert_eq!(body_size, 0);
 
-    let response = read_full_body(&mut read_half, &mut buf, builder, body_size, TIMEOUT)
-        .await
-        .unwrap();
+    let response = response_of(read_half, buf, builder, BodyFraming::LengthBased(body_size)).await;
     assert_eq!(response.status(), 304);
-    assert!(collect_body(response).await.is_empty());
+    assert!(response.into_body().is_empty());
 }
 
 /// A 2xx response to CONNECT establishes a tunnel and carries no body.
@@ -275,7 +273,7 @@ async fn connect_2xx_returns_empty() {
     let (mut read_half, _held, mut buf) =
         setup(b"HTTP/1.1 200 Connection Established\r\n\r\n", false).await;
 
-    let body_reader = read_headers(
+    let response_head = read_headers(
         &mut read_half,
         &mut buf,
         TIMEOUT,
@@ -285,8 +283,8 @@ async fn connect_2xx_returns_empty() {
     .await
     .unwrap();
 
-    match body_reader {
-        BodyReader::LengthBased { body_size, .. } => assert_eq!(body_size, 0),
+    match response_head {
+        ResponseHead::LengthBased { body_size, .. } => assert_eq!(body_size, 0),
         other => panic!("Expected LengthBased {{ body_size: 0 }}, got {:?}", other),
     }
 }
@@ -297,55 +295,49 @@ async fn length_based_body_still_works() {
     let (mut read_half, _held, mut buf) =
         setup(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello", false).await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
-    let (builder, body_size) = match body_reader {
-        BodyReader::LengthBased { builder, body_size } => (builder, body_size),
+    let (builder, body_size) = match response_head {
+        ResponseHead::LengthBased { builder, body_size } => (builder, body_size),
         other => panic!("Expected LengthBased, got {:?}", other),
     };
     assert_eq!(body_size, 5);
 
-    let response = read_full_body(&mut read_half, &mut buf, builder, body_size, TIMEOUT)
-        .await
-        .unwrap();
+    let response = response_of(read_half, buf, builder, BodyFraming::LengthBased(body_size)).await;
     assert_eq!(response.status(), 200);
-    assert_eq!(collect_body(response).await, b"Hello");
+    assert_eq!(response.into_body(), b"Hello");
 }
 
 /// A chunked response still works unchanged.
 #[tokio::test]
 async fn chunked_body_still_works() {
-    let (read_half, _held, buf) = setup(
+    let (mut read_half, _held, mut buf) = setup(
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n",
         false,
     )
     .await;
 
-    let mut read_half = read_half;
-    let mut buf = buf;
-
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
-    let (response, sender) = match body_reader {
-        BodyReader::Chunked { response, sender } => (response, sender),
+    let builder = match response_head {
+        ResponseHead::Chunked { builder } => builder,
         other => panic!("Expected Chunked, got {:?}", other),
     };
 
-    let reader = tokio::spawn(async move {
-        read_chunked_body(&mut read_half, &mut buf, sender, TIMEOUT, false)
-            .await
-            .unwrap();
-    });
+    let response = response_of(
+        read_half,
+        buf,
+        builder,
+        BodyFraming::Chunked(ChunksReadingMode::WaitingFroChunkSize),
+    )
+    .await;
 
     assert_eq!(response.status(), 200);
-    let body = collect_body(response).await;
-    reader.await.unwrap();
-
-    assert_eq!(body, b"Hello World");
+    assert_eq!(response.into_body(), b"Hello World");
 }
 
 /// A non-websocket interim 1xx response (100 Continue) must be signalled as
@@ -363,7 +355,7 @@ async fn interim_100_continue_is_skipped_then_final_response_read() {
         .await
         .unwrap();
     assert!(
-        matches!(first, BodyReader::Interim),
+        matches!(first, ResponseHead::Interim),
         "Expected Interim for 100 Continue, got {:?}",
         first
     );
@@ -373,16 +365,14 @@ async fn interim_100_continue_is_skipped_then_final_response_read() {
         .await
         .unwrap();
     let (builder, body_size) = match second {
-        BodyReader::LengthBased { builder, body_size } => (builder, body_size),
+        ResponseHead::LengthBased { builder, body_size } => (builder, body_size),
         other => panic!("Expected LengthBased, got {:?}", other),
     };
     assert_eq!(body_size, 2);
 
-    let response = read_full_body(&mut read_half, &mut buf, builder, body_size, TIMEOUT)
-        .await
-        .unwrap();
+    let response = response_of(read_half, buf, builder, BodyFraming::LengthBased(body_size)).await;
     assert_eq!(response.status(), 200);
-    assert_eq!(collect_body(response).await, b"hi");
+    assert_eq!(response.into_body(), b"hi");
 }
 
 /// 103 Early Hints (with informational headers) is likewise an interim response.
@@ -394,14 +384,14 @@ async fn early_hints_103_is_interim() {
     )
     .await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
     assert!(
-        matches!(body_reader, BodyReader::Interim),
+        matches!(response_head, ResponseHead::Interim),
         "Expected Interim for 103 Early Hints, got {:?}",
-        body_reader
+        response_head
     );
 }
 
@@ -417,14 +407,14 @@ async fn websocket_upgrade_still_detected() {
     )
     .await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
     assert!(
-        matches!(body_reader, BodyReader::WebSocketUpgrade(_)),
+        matches!(response_head, ResponseHead::WebSocketUpgrade(_)),
         "Expected WebSocketUpgrade, got {:?}",
-        body_reader
+        response_head
     );
 }
 
@@ -441,14 +431,14 @@ async fn switching_protocols_to_a_non_websocket_protocol_is_not_interim() {
     )
     .await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
     assert!(
-        matches!(body_reader, BodyReader::SwitchedProtocols { .. }),
+        matches!(response_head, ResponseHead::SwitchedProtocols { .. }),
         "Expected SwitchedProtocols, got {:?}",
-        body_reader
+        response_head
     );
 }
 
@@ -464,14 +454,14 @@ async fn websocket_upgrade_is_a_plain_protocol_switch_without_the_feature() {
     )
     .await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
         .await
         .unwrap();
 
     assert!(
-        matches!(body_reader, BodyReader::SwitchedProtocols { .. }),
+        matches!(response_head, ResponseHead::SwitchedProtocols { .. }),
         "Expected SwitchedProtocols, got {:?}",
-        body_reader
+        response_head
     );
 }
 
@@ -480,22 +470,19 @@ async fn websocket_upgrade_is_a_plain_protocol_switch_without_the_feature() {
 /// responses.
 #[tokio::test]
 async fn unknown_method_defaults_to_until_close() {
-    let (mut read_half, _held, mut buf) =
-        setup(b"HTTP/1.1 200 OK\r\n\r\npayload", true).await;
+    let (mut read_half, _held, mut buf) = setup(b"HTTP/1.1 200 OK\r\n\r\npayload", true).await;
 
-    let body_reader = read_headers(&mut read_half, &mut buf, TIMEOUT, false, None)
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, None)
         .await
         .unwrap();
 
-    let builder = match body_reader {
-        BodyReader::UntilClose { builder } => builder,
+    let builder = match response_head {
+        ResponseHead::UntilClose { builder } => builder,
         other => panic!("Expected UntilClose, got {:?}", other),
     };
 
-    let response = read_until_close(&mut read_half, &mut buf, builder, TIMEOUT)
-        .await
-        .unwrap();
-    assert_eq!(collect_body(response).await, b"payload");
+    let response = response_of(read_half, buf, builder, BodyFraming::UntilClose).await;
+    assert_eq!(response.into_body(), b"payload");
 }
 
 /// The method the framing logic relies on is derived by `MyHttpRequest::get_method`

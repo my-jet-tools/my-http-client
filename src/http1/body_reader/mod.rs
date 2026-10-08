@@ -3,25 +3,22 @@ use bytes::Bytes;
 #[cfg(feature = "with-websocket")]
 use http_body_util::combinators::BoxBody;
 
-mod full_body_reader;
-pub use full_body_reader::*;
 mod body_reader_chunked;
 pub use body_reader_chunked::*;
-mod until_close_body_reader;
-pub use until_close_body_reader::*;
+mod body_framing;
+pub use body_framing::*;
+mod response_body_on_the_wire;
+pub use response_body_on_the_wire::*;
 
-mod full_body_reader_inner;
-pub use full_body_reader_inner::*;
-
+/// The head of a response which is read, and what it says about what follows it
 #[derive(Debug)]
-pub enum BodyReader {
+pub enum ResponseHead {
     LengthBased {
         builder: http::response::Builder,
         body_size: usize,
     },
     Chunked {
-        response: crate::HyperResponse,
-        sender: ChunksSender,
+        builder: http::response::Builder,
     },
     /// A close-delimited response body (RFC 9112 §6.3): no `Content-Length` and
     /// no `Transfer-Encoding`, so the body runs until the connection is closed.

@@ -16,7 +16,7 @@ use crate::{MyHttpClientConnector, MyHttpClientError, RequestBodyStream};
 use super::MyHttp2Client;
 
 pub struct TestConnector {
-    host_port: String,
+    pub host_port: String,
 }
 
 #[async_trait::async_trait]
@@ -203,9 +203,7 @@ async fn test_a_body_shorter_than_the_announced_content_length_fails() {
     assert!(result.is_err());
 }
 
-async fn get_response_body(
-    response: hyper::Response<http_body_util::combinators::BoxBody<Bytes, String>>,
-) -> Vec<u8> {
+async fn get_response_body(response: hyper::Response<crate::BodyReader>) -> Vec<u8> {
     assert_eq!(response.status(), 200);
     response
         .into_body()

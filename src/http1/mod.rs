@@ -53,13 +53,27 @@ mod request_input_tests;
 mod response_input_tests;
 
 #[cfg(test)]
+mod response_body_reader_tests;
+
+#[cfg(test)]
 mod contract_tests;
 
 const CONTENT_LENGTH_HEADER_NAME: &str = "content-length";
 const TRANSFER_ENCODING_HEADER_NAME: &str = "transfer-encoding";
 
-pub const MAX_RESPONSE_BODY_SIZE: usize = 100 * 1024 * 1024;
-pub const MAX_CHUNK_SIZE: usize = 100 * 1024 * 1024;
+/// The biggest piece a response body is sent to its reader in. What a read() of the
+/// socket has brought is sent as it is, unless it is bigger than that
+pub const MAX_RESPONSE_BODY_PIECE_SIZE: usize = 64 * 1024;
+
+/// How much of a response body nobody is going to read - its reader is dropped before
+/// the end of it - is read past to keep the connection. A connection with more than
+/// that left on the wire is closed: dialing a new one is cheaper than downloading it
+pub const MAX_ABANDONED_BODY_SIZE: usize = 1024 * 1024;
+
+/// How long the rest of an abandoned body is waited for. The requests which are sent
+/// meanwhile are behind that body on the wire, so a body which does not end by then -
+/// an event stream, a slow upstream - costs them the connection instead of their time
+pub const ABANDONED_BODY_SKIP_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_RESPONSE_HEADERS_COUNT: usize = 256;
 
 /// Upper bound on consecutive interim (1xx) responses accepted before a final

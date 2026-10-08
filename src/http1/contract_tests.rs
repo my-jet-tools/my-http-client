@@ -48,7 +48,8 @@ fn a_buffer_nothing_was_read_into_has_no_line() {
 
 #[tokio::test]
 async fn a_task_which_is_not_a_websocket_upgrade_gives_no_upgrade() {
-    let response = HttpTask::<DuplexStream>::Response(empty_response());
+    let response =
+        HttpTask::<DuplexStream>::Response(hyper::Response::new(crate::BodyReader::empty()));
     assert!(response.into_websocket_upgrade().is_none());
 
     let (client, _upstream) = tokio::io::duplex(64);

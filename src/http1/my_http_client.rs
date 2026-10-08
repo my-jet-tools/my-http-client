@@ -1,6 +1,7 @@
 use std::sync::{atomic::AtomicU64, Arc};
 
 use http_body_util::BodyExt;
+use tokio::time::Instant;
 
 use crate::{MyHttpClientConnector, MyHttpClientError};
 
@@ -216,8 +217,11 @@ impl<
         &self,
         request: &MyHttpRequest,
         request_timeout: std::time::Duration,
-    ) -> Result<(HttpTask<TStream>, u64), MyHttpClientError> {
+    ) -> Result<(HttpTask<TStream>, u64, Option<Instant>), MyHttpClientError> {
         loop {
+            // Every attempt has the whole timeout, and so has the body of its response
+            let deadline = Instant::now().checked_add(request_timeout);
+
             let err = match self.inner.send(request).await {
                 Ok((awaiter, connection_id)) => {
                     let await_feature = awaiter.get_result();
@@ -228,7 +232,7 @@ impl<
                     };
 
                     match result {
-                        Ok(response) => return Ok((response, connection_id)),
+                        Ok(response) => return Ok((response, connection_id, deadline)),
                         Err(err) => err,
                     }
                 }
@@ -313,6 +317,8 @@ impl<
             }
         };
 
+        let deadline = Instant::now().checked_add(request_timeout);
+
         let result = tokio::time::timeout(
             request_timeout,
             self.stream_body(body, connection_id, content_size, awaiter),
@@ -329,7 +335,8 @@ impl<
             }
         };
 
-        self.get_response(task, connection_id).await
+        self.get_response(task, connection_id, deadline, request_timeout)
+            .await
     }
 
     async fn stream_body<TBody>(
@@ -404,13 +411,24 @@ impl<
         awaiter.get_result().await
     }
 
+    /// `deadline` is when the request runs out of the `request_timeout` it was sent
+    /// with: the body of the response is not read yet, and reading it into memory as a
+    /// whole is a part of the same request
     async fn get_response(
         &self,
         task: HttpTask<TStream>,
         connection_id: u64,
+        deadline: Option<Instant>,
+        request_timeout: std::time::Duration,
     ) -> Result<MyHttpResponse<TStream>, MyHttpClientError> {
         match task {
-            HttpTask::Response(response) => Ok(MyHttpResponse::Response(response)),
+            HttpTask::Response(mut response) => {
+                response
+                    .body_mut()
+                    .set_request_deadline(deadline, request_timeout);
+
+                Ok(MyHttpResponse::Response(response))
+            }
             HttpTask::WebsocketUpgrade {
                 response,
                 read_part,
@@ -439,14 +457,15 @@ impl<
     ) -> Result<MyHttpResponse<TStream>, MyHttpClientError> {
         let response = self.send_payload(req, request_timeout).await;
 
-        let (task, connection_id) = match response {
+        let (task, connection_id, deadline) = match response {
             Ok(task) => task,
             Err(err) => {
                 return Err(err);
             }
         };
 
-        self.get_response(task, connection_id).await
+        self.get_response(task, connection_id, deadline, request_timeout)
+            .await
     }
 }
 

@@ -3,13 +3,11 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
 use hyper::client::conn::http2::SendRequest;
 use rust_extensions::date_time::DateTimeAsMicroseconds;
 use tokio::sync::Mutex;
 
-use crate::{hyper::*, HyperRequest, HyperRequestBody};
+use crate::{hyper::*, BodyReader, HyperRequest, HyperRequestBody};
 
 /// A single timed out request is a slow stream, not a dead connection. But this many
 /// timeout rounds in a row with no success in between means the connection itself is
@@ -79,12 +77,17 @@ impl MyHttp2ClientInner {
 
     /// The body is already erased to [`crate::HyperRequestBody`] here: one connection
     /// carries both the buffered and the streamed requests, so a single body type has to
-    /// travel through `SendRequest`
+    /// travel through `SendRequest`.
+    ///
+    /// The response comes back on its head: its body is read through the
+    /// [`BodyReader`] it carries
     pub async fn send_payload(
         &self,
         req: HyperRequest,
         request_timeout: Duration,
-    ) -> Result<hyper::Response<BoxBody<Bytes, String>>, SendHyperPayloadError> {
+    ) -> Result<hyper::Response<BodyReader>, SendHyperPayloadError> {
+        let deadline = tokio::time::Instant::now().checked_add(request_timeout);
+
         let (send_request_feature, connected, current_connection_id) = {
             let mut state = self.state.lock().await;
             match &mut *state {
@@ -118,7 +121,11 @@ impl MyHttp2ClientInner {
         match result {
             Ok(response) => {
                 self.consecutive_timeouts.store(0, Ordering::Relaxed);
-                Ok(crate::utils::from_incoming_body(response))
+                Ok(crate::from_hyper_response(
+                    response,
+                    deadline,
+                    request_timeout,
+                ))
             }
             Err(err) => {
                 self.disconnect(current_connection_id).await;

@@ -26,6 +26,9 @@ pub type HyperRequest = http::Request<HyperRequestBody>;
 mod request_body_stream;
 pub use request_body_stream::*;
 
+mod body_reader;
+pub use body_reader::*;
+
 mod headers;
 pub use headers::*;
 
