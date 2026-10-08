@@ -279,3 +279,35 @@ async fn into_vec_is_bounded_by_the_timeout_of_the_request() {
 
     drop(frames);
 }
+
+/// The body as `rust_extensions::AsyncIterator` sees it: the portions are the pieces
+/// hyper gives, and the trailers are not among them
+#[tokio::test]
+async fn a_body_reader_is_an_async_iterator_of_bytes() {
+    let (client, frames) = client_of_an_upstream_answering_frame_by_frame(None).await;
+
+    frames.send(data(b"Hello")).unwrap();
+    frames.send(data(b"World")).unwrap();
+    frames.send(trailers()).unwrap();
+    drop(frames);
+
+    let body: Arc<
+        dyn rust_extensions::AsyncIterator<u8, MyHttpClientError> + Send + Sync + 'static,
+    > = Arc::new(
+        response_of_a_request(&client, REQUEST_TIMEOUT)
+            .await
+            .into_body(),
+    );
+
+    let received = tokio::spawn(async move {
+        let mut result = Vec::new();
+
+        while let Some(portion) = body.get_next().await.unwrap() {
+            result.extend(portion);
+        }
+
+        result
+    });
+
+    assert_eq!(received.await.unwrap(), b"HelloWorld");
+}

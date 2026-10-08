@@ -36,7 +36,9 @@ pub(crate) type RequestDeadline = (tokio::time::Instant, Duration);
 /// reads the connection is what the two cases are about, and each of them has the whole
 /// of its reading in its inner.
 ///
-/// It is a `hyper::body::Body` too, so it can be handed to hyper as it is.
+/// It is a `hyper::body::Body` too, so it can be handed to hyper as it is, and a
+/// [`rust_extensions::AsyncIterator`] of bytes, for whoever reads a source in portions
+/// and does not care that it is the body of a response.
 pub enum BodyReader {
     /// A response of the non-hyper client: the body is written by the read loop of the
     /// client as it comes off the socket, and received through a channel which holds
@@ -98,12 +100,8 @@ impl BodyReader {
                 return Ok(None);
             };
 
-            let frame = frame.map_err(MyHttpClientError::CanNotExecuteRequest)?;
-
-            // The trailers of an HTTP/2 response are not a part of the body
-            match frame.into_data() {
-                Ok(data) if !data.is_empty() => return Ok(Some(data)),
-                _ => {}
+            if let Some(piece) = into_piece(frame)? {
+                return Ok(Some(piece));
             }
         }
     }
@@ -189,6 +187,45 @@ impl BodyReader {
         match self {
             Self::NoHyper(inner) => inner.request_deadline = request_deadline,
             Self::Hyper(inner) => inner.request_deadline = request_deadline,
+        }
+    }
+}
+
+/// The piece of the body a frame carries. `None` is a frame which carries none: the
+/// trailers of an HTTP/2 response are not a part of the body
+fn into_piece(frame: Result<Frame<Bytes>, String>) -> Result<Option<Bytes>, MyHttpClientError> {
+    let frame = frame.map_err(MyHttpClientError::CanNotExecuteRequest)?;
+    Ok(frame.into_data().ok().filter(|data| !data.is_empty()))
+}
+
+/// The body as a source which is read in portions. A portion is a piece of the body,
+/// as it has come over the network - what [`BodyReader::get_next`] gives - and `None`
+/// is the end of the body. The trailers of an HTTP/2 response are read past, and
+/// nothing bounds the reading: neither a limit of the size nor the timeout of the
+/// request.
+///
+/// It reads through a shared reference, so the reader can be handed over as an
+/// `Arc<dyn AsyncIterator<u8, MyHttpClientError> + Send + Sync>`. The body is still one
+/// stream: the callers take turns, and each portion goes to one of them.
+///
+/// Both this and [`BodyReader::get_next`] are named `get_next`. With the trait in scope
+/// `body_reader.get_next()` is this one, without it - the other.
+#[async_trait::async_trait]
+impl rust_extensions::AsyncIterator<u8, MyHttpClientError> for BodyReader {
+    async fn get_next(&self) -> Result<Option<Vec<u8>>, MyHttpClientError> {
+        loop {
+            let frame = match self {
+                Self::NoHyper(inner) => inner.next_frame().await,
+                Self::Hyper(inner) => inner.next_frame().await,
+            };
+
+            let Some(frame) = frame else {
+                return Ok(None);
+            };
+
+            if let Some(piece) = into_piece(frame)? {
+                return Ok(Some(piece.into()));
+            }
         }
     }
 }

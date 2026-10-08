@@ -306,6 +306,32 @@ a `HyperResponse` - `MyHttpResponse::into_response()` does that. It reports the 
 is left when the response has a `content-length`, and carries the trailers of an HTTP/2 response,
 which `get_next` and `into_vec` read past.
 
+### `BodyReader` as an `AsyncIterator`
+
+`BodyReader` is a `rust_extensions::AsyncIterator<u8, MyHttpClientError>` too - a source of bytes
+which is read in portions, for the code which does not care that it is the body of a response:
+
+```rust
+use rust_extensions::AsyncIterator;
+
+let body: Arc<dyn AsyncIterator<u8, MyHttpClientError> + Send + Sync> = Arc::new(body);
+
+while let Some(portion) = body.get_next().await? {
+    // Vec<u8>: a piece of the body, as it came over the network
+}
+```
+
+A portion is what the reader's own `get_next()` gives, as a `Vec<u8>`; the trailers of an HTTP/2
+response are read past, and nothing bounds the reading - neither a limit of the size nor the
+timeout of the request.
+
+The trait reads through a shared reference, so the reader keeps what changes behind a lock. The
+body is still one stream: the callers take turns, and each portion goes to one of them. While it
+is being read that way, `remains_to_read()` answers `None`.
+
+Both methods are named `get_next`. With the trait in scope `body.get_next()` is the trait's
+(`&self`, gives `Vec<u8>`); without it, the reader's own (`&mut self`, gives `Bytes`).
+
 ### `Hyper` / `NoHyper`: what reads the connection
 
 `BodyReader` is an enum of two cases. What reads the connection differs between the clients, and

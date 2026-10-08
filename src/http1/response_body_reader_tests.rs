@@ -941,3 +941,130 @@ async fn a_sender_is_told_when_the_reader_is_dropped() {
     sender.reader_is_dropped().await;
     assert!(!sender.send(Bytes::from_static(b"World")).await);
 }
+
+/// The body as `rust_extensions::AsyncIterator` sees it: a source of bytes which is read
+/// in portions through a shared reference, whoever holds it
+type BytesIterator =
+    Arc<dyn rust_extensions::AsyncIterator<u8, MyHttpClientError> + Send + Sync + 'static>;
+
+/// The portions are the pieces of the body as they come off the socket: the first half
+/// is read while the second one is not even written. The rest is read by another task -
+/// the reader is shared, and the future of `get_next` is `Send`
+#[tokio::test]
+async fn a_body_reader_is_an_async_iterator_of_bytes() {
+    for (first, second, then) in BODIES_IN_TWO_PARTS {
+        let (client, send_the_second_part) =
+            client_of_an_upstream_answering_in_two_parts(first, second, then).await;
+
+        let body: BytesIterator = Arc::new(body_reader_of_a_request(&client).await);
+
+        let mut the_first_half = Vec::new();
+
+        while the_first_half.len() < 5 {
+            the_first_half.extend(body.get_next().await.unwrap().unwrap());
+        }
+
+        assert_eq!(the_first_half, b"Hello");
+
+        send_the_second_part.send(()).unwrap();
+
+        let the_rest = tokio::spawn(async move {
+            let mut result = Vec::new();
+
+            while let Some(portion) = body.get_next().await.unwrap() {
+                result.extend(portion);
+            }
+
+            // A body which is over stays over
+            assert!(body.get_next().await.unwrap().is_none());
+
+            result
+        });
+
+        assert_eq!(the_rest.await.unwrap(), b"World");
+    }
+}
+
+/// A body which is cut short does not end as if it was complete, whichever way it is
+/// read
+#[tokio::test]
+async fn an_async_iterator_ends_a_body_which_is_cut_short_with_an_error() {
+    const NOT_COMPLETE: &str =
+        "CanNotExecuteRequest(\"The response body is not complete: the connection is closed\")";
+
+    let client = client_of_an_upstream_answering(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nHello",
+        Then::Close,
+    )
+    .await;
+
+    let body: BytesIterator = Arc::new(body_reader_of_a_request(&client).await);
+
+    assert_eq!(body.get_next().await.unwrap().unwrap(), b"Hello");
+    assert_eq!(error_of(body.get_next().await), NOT_COMPLETE);
+    assert_eq!(error_of(body.get_next().await), NOT_COMPLETE);
+}
+
+/// The body is one stream however many hold the reader. Two tasks read it at once: they
+/// take turns, each piece goes to one of them, and nothing is lost or left waiting
+#[tokio::test]
+async fn the_readers_of_a_shared_body_take_turns() {
+    let (listener, client) = upstream().await;
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request_heads(&mut socket, 1).await;
+        write_big_body(&mut socket).await;
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let body: BytesIterator = Arc::new(body_reader_of_a_request(&client).await);
+
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let body = body.clone();
+
+            tokio::spawn(async move {
+                let mut received = 0;
+
+                while let Some(portion) = body.get_next().await.unwrap() {
+                    received += portion.len();
+                }
+
+                received
+            })
+        })
+        .collect();
+
+    let mut received = 0;
+
+    for reader in readers {
+        received += reader.await.unwrap();
+    }
+
+    assert_eq!(received, BIG_BODY_SIZE);
+}
+
+/// How much is left is known between the reads, whichever way the body is read
+#[tokio::test]
+async fn a_body_read_as_an_async_iterator_knows_how_much_of_it_is_left() {
+    use rust_extensions::AsyncIterator;
+
+    let (sender, body) = BodyReader::new(Some(10));
+
+    assert!(sender.send(Bytes::from_static(b"Hello")).await);
+    assert!(sender.send(Bytes::from_static(b"World")).await);
+    sender.complete().await;
+
+    assert_eq!(body.remains_to_read(), Some(10));
+
+    assert_eq!(
+        AsyncIterator::get_next(&body).await.unwrap().unwrap(),
+        b"Hello"
+    );
+    assert_eq!(body.remains_to_read(), Some(5));
+
+    // What is left is read the other way, by a reader which owns the body
+    assert_eq!(body.into_vec(NO_LIMIT).await.unwrap(), b"World");
+}

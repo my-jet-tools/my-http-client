@@ -1,8 +1,11 @@
-use std::task::{ready, Context, Poll};
+use std::{
+    future::poll_fn,
+    task::{ready, Context, Poll},
+};
 
 use bytes::Bytes;
 use hyper::body::{Frame, SizeHint};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use super::{BodyEvent, BodySender, RequestDeadline, RESPONSE_BODY_CHANNEL_CAPACITY};
 
@@ -20,15 +23,21 @@ use super::{BodyEvent, BodySender, RequestDeadline, RESPONSE_BODY_CHANNEL_CAPACI
 /// once ([`crate::http1::ABANDONED_BODY_SKIP_TIMEOUT`]), and the connection is closed
 /// otherwise
 pub struct NoHyperBodyReaderInner {
-    state: State,
+    /// What changes as the body is read. It is behind a lock, so that the body can be
+    /// read through a shared reference as well - by one reader at a time
+    reading: Mutex<Reading>,
     content_length: Option<usize>,
-    /// How much of the body is received already
-    received: usize,
     pub(crate) request_deadline: Option<RequestDeadline>,
 }
 
+struct Reading {
+    state: State,
+    /// How much of the body is received already
+    received: usize,
+}
+
 enum State {
-    Reading(mpsc::Receiver<BodyEvent>),
+    Receiving(mpsc::Receiver<BodyEvent>),
     /// The body is read to its end
     Over,
     /// The body is over before its end, and this is why
@@ -43,9 +52,11 @@ impl NoHyperBodyReaderInner {
         let (sender, receiver) = mpsc::channel(RESPONSE_BODY_CHANNEL_CAPACITY);
 
         let result = Self {
-            state: State::Reading(receiver),
+            reading: Mutex::new(Reading {
+                state: State::Receiving(receiver),
+                received: 0,
+            }),
             content_length,
-            received: 0,
             request_deadline: None,
         };
 
@@ -55,9 +66,11 @@ impl NoHyperBodyReaderInner {
     /// The body of a response which has none
     pub fn empty() -> Self {
         Self {
-            state: State::Over,
+            reading: Mutex::new(Reading {
+                state: State::Over,
+                received: 0,
+            }),
             content_length: Some(0),
-            received: 0,
             request_deadline: None,
         }
     }
@@ -66,21 +79,51 @@ impl NoHyperBodyReaderInner {
         self.content_length
     }
 
-    /// How much of the body is not received yet. `None` is a body which does not say it
+    /// How much of the body is not received yet. `None` is a body which does not say
+    /// it - and a body which is being read through a shared reference right now
     pub fn remains_to_read(&self) -> Option<usize> {
-        match &self.state {
-            State::Reading(_) => Some(self.content_length?.saturating_sub(self.received)),
+        let reading = self.reading.try_lock().ok()?;
+
+        match &reading.state {
+            State::Receiving(_) => Some(self.content_length?.saturating_sub(reading.received)),
             State::Over => Some(0),
             State::Failed(_) => None,
         }
     }
 
+    /// The next frame for a reader which owns the body: nobody else can be reading it
     pub(crate) fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, String>>> {
+        self.reading.get_mut().poll_frame(cx)
+    }
+
+    /// The next frame for a reader which shares the body. The readers take turns: the
+    /// one which is waiting for a frame holds the others back until it has got it
+    pub(crate) async fn next_frame(&self) -> Option<Result<Frame<Bytes>, String>> {
+        let mut reading = self.reading.lock().await;
+        poll_fn(|cx| reading.poll_frame(cx)).await
+    }
+
+    pub(crate) fn is_end_stream(&self) -> bool {
+        self.reading
+            .try_lock()
+            .is_ok_and(|reading| matches!(reading.state, State::Over))
+    }
+
+    pub(crate) fn size_hint(&self) -> SizeHint {
+        match self.remains_to_read() {
+            Some(remains) => SizeHint::with_exact(remains as u64),
+            None => SizeHint::default(),
+        }
+    }
+}
+
+impl Reading {
+    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, String>>> {
         let receiver = match &mut self.state {
-            State::Reading(receiver) => receiver,
+            State::Receiving(receiver) => receiver,
             State::Over => return Poll::Ready(None),
             State::Failed(reason) => return Poll::Ready(Some(Err(reason.clone()))),
         };
@@ -103,17 +146,6 @@ impl NoHyperBodyReaderInner {
         };
 
         Poll::Ready(result)
-    }
-
-    pub(crate) fn is_end_stream(&self) -> bool {
-        matches!(self.state, State::Over)
-    }
-
-    pub(crate) fn size_hint(&self) -> SizeHint {
-        match self.remains_to_read() {
-            Some(remains) => SizeHint::with_exact(remains as u64),
-            None => SizeHint::default(),
-        }
     }
 
     /// Nobody reads the body past a failure, and dropping the receiving side is what

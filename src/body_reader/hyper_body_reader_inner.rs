@@ -1,10 +1,12 @@
 use std::{
+    future::poll_fn,
     pin::Pin,
     task::{ready, Context, Poll},
 };
 
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
+use tokio::sync::Mutex;
 
 use super::RequestDeadline;
 
@@ -16,7 +18,9 @@ use super::RequestDeadline;
 /// does it: an HTTP/1.1 connection is busy with a body until it is read or dropped, an
 /// HTTP/2 stream has a window of its own and does not hold the others
 pub struct HyperBodyReaderInner {
-    state: State,
+    /// What changes as the body is read. It is behind a lock, so that the body can be
+    /// read through a shared reference as well - by one reader at a time
+    reading: Mutex<State>,
     content_length: Option<usize>,
     pub(crate) request_deadline: Option<RequestDeadline>,
 }
@@ -35,7 +39,7 @@ impl HyperBodyReaderInner {
         let content_length = exact_size(&body);
 
         Self {
-            state: State::Reading(body),
+            reading: Mutex::new(State::Reading(body)),
             content_length,
             request_deadline: None,
         }
@@ -45,20 +49,51 @@ impl HyperBodyReaderInner {
         self.content_length
     }
 
-    /// How much of the body is not read yet. `None` is a body which does not say it
+    /// How much of the body is not read yet. `None` is a body which does not say it -
+    /// and a body which is being read through a shared reference right now
     pub fn remains_to_read(&self) -> Option<usize> {
-        match &self.state {
+        match &*self.reading.try_lock().ok()? {
             State::Reading(body) => exact_size(body),
             State::Over => Some(0),
             State::Failed(_) => None,
         }
     }
 
+    /// The next frame for a reader which owns the body: nobody else can be reading it
     pub(crate) fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, String>>> {
-        let body = match &mut self.state {
+        self.reading.get_mut().poll_frame(cx)
+    }
+
+    /// The next frame for a reader which shares the body. The readers take turns: the
+    /// one which is waiting for a frame holds the others back until it has got it
+    pub(crate) async fn next_frame(&self) -> Option<Result<Frame<Bytes>, String>> {
+        let mut reading = self.reading.lock().await;
+        poll_fn(|cx| reading.poll_frame(cx)).await
+    }
+
+    pub(crate) fn is_end_stream(&self) -> bool {
+        match self.reading.try_lock().as_deref() {
+            Ok(State::Reading(body)) => body.is_end_stream(),
+            Ok(State::Over) => true,
+            Ok(State::Failed(_)) | Err(_) => false,
+        }
+    }
+
+    pub(crate) fn size_hint(&self) -> SizeHint {
+        match self.reading.try_lock().as_deref() {
+            Ok(State::Reading(body)) => body.size_hint(),
+            Ok(State::Over) => SizeHint::with_exact(0),
+            Ok(State::Failed(_)) | Err(_) => SizeHint::default(),
+        }
+    }
+}
+
+impl State {
+    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, String>>> {
+        let body = match self {
             State::Reading(body) => body,
             State::Over => return Poll::Ready(None),
             State::Failed(reason) => return Poll::Ready(Some(Err(reason.clone()))),
@@ -68,32 +103,16 @@ impl HyperBodyReaderInner {
             Some(Ok(frame)) => Some(Ok(frame)),
             Some(Err(err)) => {
                 let reason = format!("The response body is not complete: {}", err);
-                self.state = State::Failed(reason.clone());
+                *self = State::Failed(reason.clone());
                 Some(Err(reason))
             }
             None => {
-                self.state = State::Over;
+                *self = State::Over;
                 None
             }
         };
 
         Poll::Ready(result)
-    }
-
-    pub(crate) fn is_end_stream(&self) -> bool {
-        match &self.state {
-            State::Reading(body) => body.is_end_stream(),
-            State::Over => true,
-            State::Failed(_) => false,
-        }
-    }
-
-    pub(crate) fn size_hint(&self) -> SizeHint {
-        match &self.state {
-            State::Reading(body) => body.size_hint(),
-            State::Over => SizeHint::with_exact(0),
-            State::Failed(_) => SizeHint::default(),
-        }
     }
 }
 

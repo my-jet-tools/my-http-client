@@ -369,3 +369,41 @@ async fn a_reader_which_is_dropped_lets_the_connection_go() {
 
     assert!(is_the_connection_closed.await.unwrap());
 }
+
+/// The body as `rust_extensions::AsyncIterator` sees it: the portions are the pieces
+/// hyper gives, read through a shared reference - the rest of them by another task
+#[tokio::test]
+async fn a_body_reader_is_an_async_iterator_of_bytes() {
+    let (client, send_the_second_part) = client_of_an_upstream_answering_in_two_parts(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nHello",
+        b"World",
+        Then::KeepOpen,
+    )
+    .await;
+
+    let body: std::sync::Arc<
+        dyn rust_extensions::AsyncIterator<u8, MyHttpClientError> + Send + Sync + 'static,
+    > = std::sync::Arc::new(body_reader_of_a_request(&client, REQUEST_TIMEOUT).await);
+
+    let mut the_first_half = Vec::new();
+
+    while the_first_half.len() < 5 {
+        the_first_half.extend(body.get_next().await.unwrap().unwrap());
+    }
+
+    assert_eq!(the_first_half, b"Hello");
+
+    send_the_second_part.send(()).unwrap();
+
+    let the_rest = tokio::spawn(async move {
+        let mut result = Vec::new();
+
+        while let Some(portion) = body.get_next().await.unwrap() {
+            result.extend(portion);
+        }
+
+        result
+    });
+
+    assert_eq!(the_rest.await.unwrap(), b"World");
+}
