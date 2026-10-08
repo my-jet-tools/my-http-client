@@ -108,8 +108,8 @@ async fn read_exactly(body: &mut BodyReader, size: usize) -> Vec<u8> {
     let mut result = Vec::new();
 
     while result.len() < size {
-        let piece = body.get_next().await.unwrap();
-        result.extend_from_slice(&piece.expect("The body is over before its time"));
+        let piece = body.next_item().await.unwrap();
+        result.extend_from_slice(piece.expect("The body is over before its time").as_slice());
     }
 
     result
@@ -138,10 +138,10 @@ async fn a_body_is_given_as_it_comes() {
         drop(frames);
 
         assert_eq!(read_exactly(&mut body, 5).await, b"World");
-        assert!(body.get_next().await.unwrap().is_none());
+        assert!(body.next_item().await.unwrap().is_none());
 
         // A body which is over stays over
-        assert!(body.get_next().await.unwrap().is_none());
+        assert!(body.next_item().await.unwrap().is_none());
         assert!(body.is_end_stream());
     }
 }
@@ -211,7 +211,7 @@ async fn the_trailers_are_not_given_as_the_body() {
         .into_body();
 
     assert_eq!(read_exactly(&mut body, 5).await, b"Hello");
-    assert!(body.get_next().await.unwrap().is_none());
+    assert!(body.next_item().await.unwrap().is_none());
 
     let (client, frames) = client_of_an_upstream_answering_frame_by_frame(None).await;
 
@@ -280,10 +280,10 @@ async fn into_vec_is_bounded_by_the_timeout_of_the_request() {
     drop(frames);
 }
 
-/// The body as `rust_extensions::AsyncIterator` sees it: the portions are the pieces
-/// hyper gives, and the trailers are not among them
+/// The body as `rust_extensions::AsyncBytesStream` sees it: a source of bytes, and the
+/// trailers are not among them
 #[tokio::test]
-async fn a_body_reader_is_an_async_iterator_of_bytes() {
+async fn a_body_reader_is_an_async_bytes_stream() {
     let (client, frames) = client_of_an_upstream_answering_frame_by_frame(None).await;
 
     frames.send(data(b"Hello")).unwrap();
@@ -292,18 +292,23 @@ async fn a_body_reader_is_an_async_iterator_of_bytes() {
     drop(frames);
 
     let body: Arc<
-        dyn rust_extensions::AsyncIterator<u8, MyHttpClientError> + Send + Sync + 'static,
+        dyn rust_extensions::AsyncBytesStream<MyHttpClientError, Chunk = Bytes>
+            + Send
+            + Sync
+            + 'static,
     > = Arc::new(
         response_of_a_request(&client, REQUEST_TIMEOUT)
             .await
             .into_body(),
     );
 
+    assert_eq!(body.get_size(), None);
+
     let received = tokio::spawn(async move {
         let mut result = Vec::new();
 
-        while let Some(portion) = body.get_next().await.unwrap() {
-            result.extend(portion);
+        while let Some(bytes) = body.get_next().await.unwrap() {
+            result.extend(bytes);
         }
 
         result

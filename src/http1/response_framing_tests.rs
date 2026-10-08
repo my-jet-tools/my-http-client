@@ -58,7 +58,7 @@ async fn response_of(
     let mut data = Vec::new();
 
     while let Some(piece) = body.next_piece().await.unwrap() {
-        data.extend_from_slice(&piece);
+        data.extend_from_slice(piece.as_slice());
     }
 
     builder.body(data).unwrap()
@@ -338,6 +338,49 @@ async fn chunked_body_still_works() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.into_body(), b"Hello World");
+}
+
+/// A chunked body is given the way it is on the wire, a chunk a piece: the size of the
+/// chunk, its data, its separator - with the data in one place of the piece. The chunk
+/// of no size which ends the body is the last piece, and the only one with no data
+#[tokio::test]
+async fn chunked_body_is_cut_into_pieces_by_its_chunks() {
+    let (mut read_half, _held, mut buf) = setup(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n",
+        false,
+    )
+    .await;
+
+    let response_head = read_headers(&mut read_half, &mut buf, TIMEOUT, false, Some(Method::GET))
+        .await
+        .unwrap();
+
+    assert!(matches!(response_head, ResponseHead::Chunked { .. }));
+
+    let mut body = ResponseBodyOnTheWire::new(
+        &mut read_half,
+        &mut buf,
+        BodyFraming::Chunked(ChunksReadingMode::WaitingFroChunkSize),
+        TIMEOUT,
+        false,
+    );
+
+    let expected: [(&[u8], &[u8]); 3] = [
+        (b"5\r\nHello\r\n", b"Hello"),
+        (b"6\r\n World\r\n", b" World"),
+        (b"0\r\n\r\n", b""),
+    ];
+
+    for (as_it_is_on_the_wire, data) in expected {
+        let piece = body.next_piece().await.unwrap().unwrap();
+
+        assert!(matches!(piece, crate::BodyChunk::Chunked(_)));
+        assert_eq!(piece.as_raw_slice(), as_it_is_on_the_wire);
+        assert_eq!(piece.as_slice(), data);
+    }
+
+    assert!(body.next_piece().await.unwrap().is_none());
+    assert!(body.is_completed());
 }
 
 /// A non-websocket interim 1xx response (100 Continue) must be signalled as

@@ -97,8 +97,8 @@ async fn read_exactly(body: &mut BodyReader, size: usize) -> Vec<u8> {
     let mut result = Vec::new();
 
     while result.len() < size {
-        let piece = body.get_next().await.unwrap();
-        result.extend_from_slice(&piece.expect("The body is over before its time"));
+        let piece = body.next_item().await.unwrap();
+        result.extend_from_slice(piece.expect("The body is over before its time").as_slice());
     }
 
     result
@@ -136,10 +136,10 @@ async fn a_body_is_given_as_it_comes_off_the_socket() {
         send_the_second_part.send(()).unwrap();
 
         assert_eq!(read_exactly(&mut body, 5).await, b"World");
-        assert!(body.get_next().await.unwrap().is_none());
+        assert!(body.next_item().await.unwrap().is_none());
 
         // A body which is over stays over
-        assert!(body.get_next().await.unwrap().is_none());
+        assert!(body.next_item().await.unwrap().is_none());
         assert!(body.is_end_stream());
     }
 }
@@ -234,7 +234,7 @@ async fn a_body_which_is_cut_short_ends_with_an_error() {
 
     send_the_second_part.send(()).unwrap();
 
-    let Err(MyHttpClientError::CanNotExecuteRequest(reason)) = body.get_next().await else {
+    let Err(MyHttpClientError::CanNotExecuteRequest(reason)) = body.next_item().await else {
         panic!("A body which is cut short has to end with an error");
     };
 
@@ -245,7 +245,7 @@ async fn a_body_which_is_cut_short_ends_with_an_error() {
     );
 
     // It keeps failing: asking once more does not make the body complete
-    let Err(MyHttpClientError::CanNotExecuteRequest(the_same_reason)) = body.get_next().await
+    let Err(MyHttpClientError::CanNotExecuteRequest(the_same_reason)) = body.next_item().await
     else {
         panic!("A body which has failed has to keep failing");
     };
@@ -322,7 +322,9 @@ async fn a_body_nobody_reads_stays_with_the_upstream() {
 
     let mut received = 0;
 
-    while let Some(piece) = body.get_next().await.unwrap() {
+    while let Some(piece) = body.next_item().await.unwrap() {
+        let piece = piece.as_slice();
+
         assert!(piece.iter().all(|byte| *byte == 7));
         received += piece.len();
     }
@@ -370,10 +372,47 @@ async fn a_reader_which_is_dropped_lets_the_connection_go() {
     assert!(is_the_connection_closed.await.unwrap());
 }
 
-/// The body as `rust_extensions::AsyncIterator` sees it: the portions are the pieces
-/// hyper gives, read through a shared reference - the rest of them by another task
+/// hyper takes the chunks of a chunked body apart before the body gets to the reader:
+/// what has come to it is the data, so the pieces are raw whatever the body was framed
+/// with on the wire
 #[tokio::test]
-async fn a_body_reader_is_an_async_iterator_of_bytes() {
+async fn the_pieces_hyper_gives_are_raw() {
+    let responses: [(&'static [u8], &'static [u8]); 2] = [
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nHello",
+            b"World",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n",
+            b"5\r\nWorld\r\n0\r\n\r\n",
+        ),
+    ];
+
+    for (first, second) in responses {
+        let (client, send_the_second_part) =
+            client_of_an_upstream_answering_in_two_parts(first, second, Then::KeepOpen).await;
+
+        let mut body = body_reader_of_a_request(&client, REQUEST_TIMEOUT).await;
+
+        send_the_second_part.send(()).unwrap();
+
+        let mut data = Vec::new();
+
+        while let Some(piece) = body.next_item().await.unwrap() {
+            assert!(matches!(piece, crate::BodyChunk::Raw(_)));
+            assert_eq!(piece.as_raw_slice(), piece.as_slice());
+
+            data.extend_from_slice(piece.as_slice());
+        }
+
+        assert_eq!(data, b"HelloWorld");
+    }
+}
+
+/// The body as `rust_extensions::AsyncBytesStream` sees it: a source of bytes read
+/// through a shared reference - the rest of them by another task
+#[tokio::test]
+async fn a_body_reader_is_an_async_bytes_stream() {
     let (client, send_the_second_part) = client_of_an_upstream_answering_in_two_parts(
         b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nHello",
         b"World",
@@ -382,8 +421,13 @@ async fn a_body_reader_is_an_async_iterator_of_bytes() {
     .await;
 
     let body: std::sync::Arc<
-        dyn rust_extensions::AsyncIterator<u8, MyHttpClientError> + Send + Sync + 'static,
+        dyn rust_extensions::AsyncBytesStream<MyHttpClientError, Chunk = Bytes>
+            + Send
+            + Sync
+            + 'static,
     > = std::sync::Arc::new(body_reader_of_a_request(&client, REQUEST_TIMEOUT).await);
+
+    assert_eq!(body.get_size(), Some(10));
 
     let mut the_first_half = Vec::new();
 
@@ -395,15 +439,7 @@ async fn a_body_reader_is_an_async_iterator_of_bytes() {
 
     send_the_second_part.send(()).unwrap();
 
-    let the_rest = tokio::spawn(async move {
-        let mut result = Vec::new();
+    let the_rest = tokio::spawn(async move { body.into_vec().await });
 
-        while let Some(portion) = body.get_next().await.unwrap() {
-            result.extend(portion);
-        }
-
-        result
-    });
-
-    assert_eq!(the_rest.await.unwrap(), b"World");
+    assert_eq!(the_rest.await.unwrap().unwrap(), b"World");
 }

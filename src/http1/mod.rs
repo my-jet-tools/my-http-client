@@ -56,13 +56,17 @@ mod response_input_tests;
 mod response_body_reader_tests;
 
 #[cfg(test)]
+mod tcp_buffer_tests;
+
+#[cfg(test)]
 mod contract_tests;
 
 const CONTENT_LENGTH_HEADER_NAME: &str = "content-length";
 const TRANSFER_ENCODING_HEADER_NAME: &str = "transfer-encoding";
 
 /// The biggest piece a response body is sent to its reader in. What a read() of the
-/// socket has brought is sent as it is, unless it is bigger than that
+/// socket has brought is sent as it is, unless it is bigger than that. It is the size of
+/// each of the two buffers the socket is read into
 pub const MAX_RESPONSE_BODY_PIECE_SIZE: usize = 64 * 1024;
 
 /// How much of a response body nobody is going to read - its reader is dropped before

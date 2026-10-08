@@ -1,8 +1,9 @@
-use bytes::Bytes;
 use tokio::sync::mpsc;
 
+use super::BodyChunk;
+
 pub(super) enum BodyEvent {
-    Data(Bytes),
+    Data(BodyChunk),
     /// The body is sent to its end
     Completed,
     /// The body is over before its end, and this is why
@@ -22,11 +23,16 @@ impl BodySender {
         Self { sender }
     }
 
+    /// Sends the next piece of the body - a [`BodyChunk`], or just the bytes, which
+    /// make a raw one.
+    ///
     /// Waits while [`super::RESPONSE_BODY_CHANNEL_CAPACITY`] pieces are waiting for the
-    /// reader already - that is what keeps a body nobody is in a hurry to read out of
-    /// memory. `false`: the reader is dropped, nobody needs the body any more
-    pub async fn send(&self, data: Bytes) -> bool {
-        self.sender.send(BodyEvent::Data(data)).await.is_ok()
+    /// reader already. `false`: the reader is dropped, nobody needs the body any more
+    pub async fn send(&self, chunk: impl Into<BodyChunk>) -> bool {
+        self.sender
+            .send(BodyEvent::Data(chunk.into()))
+            .await
+            .is_ok()
     }
 
     /// The body is sent to its end

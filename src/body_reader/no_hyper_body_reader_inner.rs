@@ -3,19 +3,21 @@ use std::{
     task::{ready, Context, Poll},
 };
 
-use bytes::Bytes;
 use hyper::body::{Frame, SizeHint};
 use tokio::sync::{mpsc, Mutex};
 
-use super::{BodyEvent, BodySender, RequestDeadline, RESPONSE_BODY_CHANNEL_CAPACITY};
+use super::{BodyChunk, BodyEvent, BodySender, RequestDeadline, RESPONSE_BODY_CHANNEL_CAPACITY};
 
 /// How the body of a response of the non-hyper client is read: it is received from the
 /// read loop of the client, which writes it to a [`BodySender`] as it comes off the
-/// socket - with the sizes of the chunks taken out when the body is chunked.
+/// socket. A chunked body comes the way it is on the wire - see
+/// [`BodyChunk::Chunked`].
 ///
-/// The channel between them is what gives the backpressure: once
-/// [`RESPONSE_BODY_CHANNEL_CAPACITY`] pieces wait to be received the socket is not read
-/// any more, so a body nobody reads is held by the upstream and not by this process.
+/// The pieces share the two buffers the socket is read into, and the socket is not read
+/// while both of them are held - nor while [`RESPONSE_BODY_CHANNEL_CAPACITY`] pieces wait
+/// to be received. That is the backpressure: a body nobody reads is held by the upstream
+/// and not by this process. A reader which keeps the pieces of both buffers and asks for
+/// the next one waits for ever: nothing is read until it lets go of a buffer.
 /// **So the connection is busy with the body until it is read**, and the responses to
 /// the requests pipelined behind it wait for that. A reader which is dropped before the
 /// end of the body lets the connection go: what is left of the body is read past when
@@ -32,7 +34,7 @@ pub struct NoHyperBodyReaderInner {
 
 struct Reading {
     state: State,
-    /// How much of the body is received already
+    /// How much of the data of the body is received already
     received: usize,
 }
 
@@ -95,13 +97,13 @@ impl NoHyperBodyReaderInner {
     pub(crate) fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, String>>> {
+    ) -> Poll<Option<Result<Frame<BodyChunk>, String>>> {
         self.reading.get_mut().poll_frame(cx)
     }
 
     /// The next frame for a reader which shares the body. The readers take turns: the
     /// one which is waiting for a frame holds the others back until it has got it
-    pub(crate) async fn next_frame(&self) -> Option<Result<Frame<Bytes>, String>> {
+    pub(crate) async fn next_frame(&self) -> Option<Result<Frame<BodyChunk>, String>> {
         let mut reading = self.reading.lock().await;
         poll_fn(|cx| reading.poll_frame(cx)).await
     }
@@ -121,7 +123,10 @@ impl NoHyperBodyReaderInner {
 }
 
 impl Reading {
-    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, String>>> {
+    fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<BodyChunk>, String>>> {
         let receiver = match &mut self.state {
             State::Receiving(receiver) => receiver,
             State::Over => return Poll::Ready(None),
@@ -129,9 +134,9 @@ impl Reading {
         };
 
         let result = match ready!(receiver.poll_recv(cx)) {
-            Some(BodyEvent::Data(data)) => {
-                self.received += data.len();
-                Some(Ok(Frame::data(data)))
+            Some(BodyEvent::Data(chunk)) => {
+                self.received += chunk.as_slice().len();
+                Some(Ok(Frame::data(chunk)))
             }
             Some(BodyEvent::Completed) => {
                 self.state = State::Over;

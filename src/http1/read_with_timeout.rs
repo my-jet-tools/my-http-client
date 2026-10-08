@@ -4,43 +4,21 @@ use tokio::io::{AsyncReadExt, ReadHalf};
 
 use super::{HttpParseError, TcpBuffer};
 
+/// Reads the socket once. With both buffers of the [`TcpBuffer`] held by the pieces
+/// cut out of them, it waits for one of them to be free - see [`TcpBuffer::read_from`]
 pub async fn read_to_buffer<TStream: tokio::io::AsyncRead>(
     read: &mut ReadHalf<TStream>,
     tcp_buffer: &mut TcpBuffer,
     read_time_out: Duration,
     print_http_payload: bool,
 ) -> Result<(), HttpParseError> {
-    let write_buf = match tcp_buffer.get_write_buf() {
-        Some(write_buf) if !write_buf.is_empty() => write_buf,
-        _ => {
-            return Err(HttpParseError::invalid_payload(format!(
-                "Write Buffer is too small to read http headers. Size: [{}]",
-                tcp_buffer.get_total_buffer_size()
-            )));
-        }
-    };
+    tcp_buffer.read_from(read, read_time_out).await?;
 
-    let Ok(result) = tokio::time::timeout(read_time_out, read.read(write_buf)).await else {
-        return Err(HttpParseError::ReadingTimeout(read_time_out));
-    };
-
-    match result {
-        Ok(result) => {
-            if result == 0 {
-                return Err(HttpParseError::Disconnected);
-            }
-
-            tcp_buffer.add_read_amount(result);
-
-            if print_http_payload {
-                let buf = tcp_buffer.get_buf();
-                println!("Resp: [{:?}]", std::str::from_utf8(buf));
-            }
-
-            Ok(())
-        }
-        Err(err) => Err(HttpParseError::error(err.to_string())),
+    if print_http_payload {
+        println!("Resp: [{:?}]", std::str::from_utf8(tcp_buffer.get_buf()));
     }
+
+    Ok(())
 }
 
 pub async fn read_exact<TStream: tokio::io::AsyncRead>(
